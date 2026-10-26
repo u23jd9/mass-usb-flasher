@@ -87,13 +87,15 @@ i18n! {
     sha_starting = "starting…" / "запускается…",
     target_extras_fmt = " (found {}, extras untouched)" / " (найдено {}, лишние не трогаем)",
 
-    // Footer
+    // Footer & Actions
     fk_open = "Open" / "Образ",
     fk_start = "Start" / "Старт",
     fk_help = "Help" / "Справка",
     fk_target = "Target" / "Цель",
     fk_lang = "Lang" / "Язык",
     fk_quit = "Quit" / "Выход",
+    fk_reset = "Ready" / "Сброс",
+    status_finished_hint = "Batch finished! Press [R/Enter] to switch back to Ready/Idle" / "Партия завершена! Нажмите [R/Enter] для сброса в Готово/Ожидание",
 
     // Заголовки таблицы
     th_id = "ID" / "ID",
@@ -137,6 +139,18 @@ i18n! {
 
     // Хоткеи в футере
     hotkeys_target_hint = "[+/-]" / "[+/-]",
+
+    // GUI специфичные
+    gui_btn_start = "▶ Start Flashing" / "▶ Запустить запись",
+    gui_btn_reset = "🔄 Ready for Next Batch" / "🔄 Готово к новой партии (Сброс)",
+    gui_btn_select = "📂 Select Image..." / "📂 Выбрать образ...",
+    gui_btn_catalog = "📚 Catalog" / "📚 Каталог образов",
+    gui_btn_open_once = "⚡ Open Once..." / "⚡ Открыть разово...",
+    gui_title_devices = "Connected USB Drives" / "Подключённые USB-накопители",
+    gui_title_log = "Activity Log" / "Журнал событий",
+    gui_no_devices = "No USB devices detected. Insert USB drives to start." / "USB-накопители не обнаружены. Вставьте флешки для записи.",
+    gui_waiting_devices = "Waiting for required number of drives" / "Ожидание достаточного количества устройств",
+    gui_all_done = "🎉 All target flash drives written successfully!" / "🎉 Все целевые флешки успешно записаны!",
 }
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

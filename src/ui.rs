@@ -66,8 +66,6 @@ fn render_header(f: &mut Frame, state: &AppState, area: Rect) {
         AppStatus::Finished => (t.status_finished, magenta()),
     };
 
-    // Считаем активные устройства — во время записи это «сколько участвует»,
-    // а не «сколько готово», иначе в заголовке будет 0/4.
     let active_count = state.active_or_ready_count();
     let total_found = state.devices.len();
     let target = state.target_count;
@@ -187,11 +185,15 @@ fn render_hash_line(state: &AppState) -> Line<'static> {
 
 fn render_timing_line(state: &AppState) -> Line<'static> {
     let t = state.t();
+    if state.status == AppStatus::Finished {
+        return Line::from(vec![
+            Span::styled(format!("★ {} ★", t.status_finished_hint), bold(magenta())),
+        ]);
+    }
     let Some(elapsed) = state.elapsed_secs() else {
         return Line::from("");
     };
 
-    // Прогресс на одно устройство: средний по всем активным.
     let avg_bytes = state.average_bytes_written();
     let total = state.write_total_bytes;
     let written = format!(
@@ -200,13 +202,11 @@ fn render_timing_line(state: &AppState) -> Line<'static> {
         total as f64 / 1e9
     );
 
-    // Только per-device скорость — суммировать параллельные потоки бессмысленно.
     let speed = state
         .per_device_speed_mbps()
         .map(|s| format!("{:.1} {}", s, t.speed_per_device))
         .unwrap_or_else(|| "—".to_string());
 
-    // Собираем единой строкой, чтобы не было склеек типа "1m 45sSpeed:".
     let text = format!(
         "{} {}     {} {}     {} {}",
         t.lbl_elapsed,
@@ -319,20 +319,25 @@ fn slot_progress_display(slot: &crate::app::DeviceSlot) -> String {
 fn render_footer(f: &mut Frame, state: &AppState, area: Rect) {
     let t = state.t();
 
-    let hotkeys = Line::from(vec![
-        Span::styled("[I]", yellow()),
-        Span::raw(format!(" {}  ", t.fk_open)),
-        Span::styled("[S]", yellow()),
-        Span::raw(format!(" {}  ", t.fk_start)),
-        Span::styled("[H]", yellow()),
-        Span::raw(format!(" {}  ", t.fk_help)),
-        Span::styled("[+/-]", yellow()),
-        Span::raw(format!(" {}  ", t.fk_target)),
-        Span::styled("[L]", yellow()),
-        Span::raw(format!(" {}  ", t.fk_lang)),
-        Span::styled("[Q]", yellow()),
-        Span::raw(format!(" {}", t.fk_quit)),
-    ]);
+    let mut keys = Vec::new();
+    if state.status == AppStatus::Finished {
+        keys.push(Span::styled("[R/Enter]", bold(green())));
+        keys.push(Span::styled(format!(" {}  ", t.fk_reset), bold(green())));
+    }
+    keys.push(Span::styled("[I]", yellow()));
+    keys.push(Span::raw(format!(" {}  ", t.fk_open)));
+    keys.push(Span::styled("[S]", yellow()));
+    keys.push(Span::raw(format!(" {}  ", t.fk_start)));
+    keys.push(Span::styled("[H]", yellow()));
+    keys.push(Span::raw(format!(" {}  ", t.fk_help)));
+    keys.push(Span::styled("[+/-]", yellow()));
+    keys.push(Span::raw(format!(" {}  ", t.fk_target)));
+    keys.push(Span::styled("[L]", yellow()));
+    keys.push(Span::raw(format!(" {}  ", t.fk_lang)));
+    keys.push(Span::styled("[Q]", yellow()));
+    keys.push(Span::raw(format!(" {}", t.fk_quit)));
+
+    let hotkeys = Line::from(keys);
 
     let second = if let Some(p) = &state.import_progress {
         render_import_status(state, p)
@@ -560,6 +565,7 @@ fn build_help_en(_t: &T, catalog_path: &str) -> Vec<Line<'static>> {
         Line::from(Span::styled("Main screen", bold(yellow()))),
         Line::from("  I        Open image catalog"),
         Line::from("  S        Start writing"),
+        Line::from("  R        Reset to Ready/Idle for next batch (after write)"),
         Line::from("  + / -    Change target device count"),
         Line::from("  H        This help"),
         Line::from("  L        Toggle language (EN / RU)"),
@@ -598,6 +604,7 @@ fn build_help_ru(_t: &T, catalog_path: &str) -> Vec<Line<'static>> {
         Line::from(Span::styled("Главный экран", bold(yellow()))),
         Line::from("  I        Открыть каталог образов"),
         Line::from("  S        Начать запись"),
+        Line::from("  R        Сброс в Готово/Ожидание для новой партии (после записи)"),
         Line::from("  + / -    Изменить количество целевых устройств"),
         Line::from("  H        Эта справка"),
         Line::from("  L        Переключить язык (EN / RU)"),

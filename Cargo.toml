@@ -1,11 +1,19 @@
 [package]
 name = "mass-usb-flasher"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 
+[lib]
+name = "mass_usb_flasher"
+path = "src/lib.rs"
+
 [[bin]]
-name = "muf"
-path = "src/main.rs"
+name = "muf-tui"
+path = "src/bin/tui.rs"
+
+[[bin]]
+name = "muf-gui"
+path = "src/bin/gui.rs"
 
 [dependencies]
 ratatui = "0.29"
@@ -16,6 +24,7 @@ crossbeam = "0.3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 rfd = "0.15"
+eframe = { version = "0.29", default-features = false, features = ["default_fonts", "glow"] }
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.58", features = [
@@ -28,6 +37,9 @@ windows = { version = "0.58", features = [
     "Win32_System_Console",
     "Win32_UI_Shell",
 ] }
+
+[target.'cfg(not(windows))'.dependencies]
+libc = "0.2"
 
 [build-dependencies]
 winres = "0.1"
