@@ -1,4 +1,5 @@
 use std::path::PathBuf;
+#[cfg(windows)]
 use std::process::Command;
 
 use crate::app::{AppState, AppStatus};

@@ -146,7 +146,8 @@ pub fn flush_file(file: &File) -> io::Result<()> {
 
 pub fn set_current_thread_max_priority() -> io::Result<()> {
     unsafe {
-        let param = libc::sched_param { sched_priority: 99 };
+        let mut param: libc::sched_param = std::mem::zeroed();
+        param.sched_priority = 99;
         let ret = libc::sched_setscheduler(0, libc::SCHED_FIFO, &param);
         if ret != 0 {
             return Err(io::Error::last_os_error());
