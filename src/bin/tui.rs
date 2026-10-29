@@ -134,6 +134,7 @@ fn run(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> io::Result<AppState
         state.drain_import_job();
         state.drain_prepare();
         state.drain_write();
+        state.drain_single_retries();
         state.auto_transition_finished();
 
         terminal.draw(|f| ui::render(f, &state))?;

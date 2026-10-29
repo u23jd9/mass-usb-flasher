@@ -297,6 +297,7 @@ fn slot_status_display(state: &AppState, s: SlotStatus) -> (&'static str, Style)
         SlotStatus::Formatting => (t.slot_formatting, yellow()),
         SlotStatus::Done => (t.slot_done, bold(green())),
         SlotStatus::Failed => (t.slot_failed, bold(red())),
+        SlotStatus::Retrying => (t.slot_retrying, bold(yellow())),
     }
 }
 
@@ -307,6 +308,13 @@ fn slot_progress_display(slot: &crate::app::DeviceSlot) -> String {
                 "FAIL".to_string()
             } else {
                 truncate(&slot.message, 30)
+            }
+        }
+        SlotStatus::Retrying => {
+            if !slot.message.is_empty() {
+                format!("{:.1}% ({})", slot.progress * 100.0, truncate(&slot.message, 24))
+            } else {
+                format!("{:>5.1}%", slot.progress * 100.0)
             }
         }
         SlotStatus::Done => "100.0%".to_string(),

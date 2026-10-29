@@ -66,6 +66,7 @@ i18n! {
     slot_formatting = "Formatting" / "Формат",
     slot_done = "Done" / "Готово",
     slot_failed = "FAILED" / "ОШИБКА",
+    slot_retrying = "Retrying" / "Повтор",
 
     // Лейблы header
     lbl_status = "Status:" / "Статус:",
@@ -156,6 +157,9 @@ i18n! {
     gui_file_picker_title = "Browse Files" / "Обзор файлов",
     gui_btn_select_dir = "✔ Select This Folder" / "✔ Выбрать эту папку",
     gui_up_dir = "⬆ Up" / "⬆ Вверх",
+    gui_btn_retry = "🔄 Retry" / "🔄 Повторить",
+    gui_log_clear = "🗑 Clear" / "🗑 Очистить",
+    gui_log_autoscroll = "Auto-scroll" / "Автопрокрутка",
 }
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

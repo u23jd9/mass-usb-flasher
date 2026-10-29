@@ -30,6 +30,7 @@ pub enum SlotStatus {
     Formatting,
     Done,
     Failed,
+    Retrying,
 }
 
 #[derive(Debug, Clone)]
@@ -39,6 +40,8 @@ pub struct DeviceSlot {
     pub progress: f32,
     pub bytes_written: u64,
     pub message: String,
+    pub retry_count: u32,
+    pub max_retries: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -111,6 +114,9 @@ pub struct AppState {
     pub devices: BTreeMap<u32, DeviceSlot>,
     pub status: AppStatus,
 
+    pub active_write_disks: Vec<u32>,
+    pub single_retry_rxs: Vec<Receiver<crate::engine::writer::SingleWriteEvent>>,
+
     pub prepare_rx: Option<Receiver<PrepareResult>>,
     pub write_rx: Option<Receiver<WriteEvent>>,
     pub write_total_bytes: u64,
@@ -160,6 +166,9 @@ impl Default for AppState {
             devices: BTreeMap::new(),
             status: AppStatus::Idle,
 
+            active_write_disks: Vec::new(),
+            single_retry_rxs: Vec::new(),
+
             prepare_rx: None,
             write_rx: None,
             write_total_bytes: 0,
@@ -202,8 +211,21 @@ impl AppState {
             DeviceEvent::Arrived(info) => self.on_device_arrived(info),
             DeviceEvent::Removed { number, path } => {
                 self.push_log(format!("[-] #{} {}", number, path));
-                self.devices.remove(&number);
-                self.recompute_status();
+                let is_active = self.status == AppStatus::Running
+                    || self
+                        .devices
+                        .get(&number)
+                        .map(|s| matches!(s.status, SlotStatus::Writing | SlotStatus::Retrying))
+                        .unwrap_or(false);
+
+                if is_active {
+                    if let Some(slot) = self.devices.get_mut(&number) {
+                        slot.message = "Disconnected, waiting for reconnect…".to_string();
+                    }
+                } else {
+                    self.devices.remove(&number);
+                    self.recompute_status();
+                }
             }
         }
     }
@@ -215,16 +237,58 @@ impl AppState {
             "[+] #{} {} ({:.2} GB) SN={}",
             n, info.product, gb, info.serial
         ));
-        self.devices.insert(
-            n,
-            DeviceSlot {
-                info,
-                status: SlotStatus::Waiting,
-                progress: 0.0,
-                bytes_written: 0,
-                message: String::new(),
-            },
-        );
+
+        // Проверяем, было ли уже это устройство (по номеру или серийному номеру)
+        let existing_number = if self.devices.contains_key(&n) {
+            Some(n)
+        } else if !info.serial.is_empty() {
+            self.devices.iter().find_map(|(&num, slot)| {
+                if slot.info.serial == info.serial {
+                    Some(num)
+                } else {
+                    None
+                }
+            })
+        } else {
+            None
+        };
+
+        if let Some(old_n) = existing_number {
+            if old_n != n {
+                if let Some(mut slot) = self.devices.remove(&old_n) {
+                    slot.info = info.clone();
+                    self.devices.insert(n, slot);
+                }
+            } else if let Some(slot) = self.devices.get_mut(&n) {
+                slot.info = info.clone();
+            }
+
+            // Если во время записи устройство отвалилось и вернулось — запускаем auto-retry
+            if self.status == AppStatus::Running {
+                if let Some(slot) = self.devices.get(&n) {
+                    if matches!(slot.status, SlotStatus::Failed | SlotStatus::Retrying)
+                        || slot.message.contains("Disconnected")
+                    {
+                        self.push_log(format!("[#{}] Reconnected during write. Triggering retry…", n));
+                        self.start_single_drive_retry(n);
+                        return;
+                    }
+                }
+            }
+        } else {
+            self.devices.insert(
+                n,
+                DeviceSlot {
+                    info,
+                    status: SlotStatus::Waiting,
+                    progress: 0.0,
+                    bytes_written: 0,
+                    message: String::new(),
+                    retry_count: 0,
+                    max_retries: 3,
+                },
+            );
+        }
         self.recompute_status();
     }
 
@@ -308,8 +372,8 @@ impl AppState {
         self.set_target_count(self.target_count.saturating_sub(1));
     }
 
-    pub fn update_progress_by_index(&mut self, index: usize, bytes_written: u64, total: u64) {
-        let Some((_, slot)) = self.devices.iter_mut().nth(index) else {
+    pub fn update_progress_by_number(&mut self, disk_number: u32, bytes_written: u64, total: u64) {
+        let Some(slot) = self.devices.get_mut(&disk_number) else {
             return;
         };
         slot.bytes_written = bytes_written;
@@ -320,9 +384,9 @@ impl AppState {
         };
     }
 
-    pub fn mark_completed_by_index(&mut self, index: usize) {
+    pub fn mark_completed_by_number(&mut self, disk_number: u32) {
         let total = self.write_total_bytes;
-        if let Some((_, slot)) = self.devices.iter_mut().nth(index) {
+        if let Some(slot) = self.devices.get_mut(&disk_number) {
             slot.status = SlotStatus::Done;
             slot.progress = 1.0;
             slot.bytes_written = total.max(slot.bytes_written);
@@ -330,10 +394,34 @@ impl AppState {
         }
     }
 
-    pub fn mark_failed_by_index(&mut self, index: usize, message: String) {
-        if let Some((_, slot)) = self.devices.iter_mut().nth(index) {
+    pub fn mark_failed_by_number(&mut self, disk_number: u32, message: String) {
+        if let Some(slot) = self.devices.get_mut(&disk_number) {
             slot.status = SlotStatus::Failed;
             slot.message = message;
+        }
+    }
+
+    pub fn update_progress_by_index(&mut self, index: usize, bytes_written: u64, total: u64) {
+        if let Some(&num) = self.active_write_disks.get(index) {
+            self.update_progress_by_number(num, bytes_written, total);
+        } else if let Some((&num, _)) = self.devices.iter().nth(index) {
+            self.update_progress_by_number(num, bytes_written, total);
+        }
+    }
+
+    pub fn mark_completed_by_index(&mut self, index: usize) {
+        if let Some(&num) = self.active_write_disks.get(index) {
+            self.mark_completed_by_number(num);
+        } else if let Some((&num, _)) = self.devices.iter().nth(index) {
+            self.mark_completed_by_number(num);
+        }
+    }
+
+    pub fn mark_failed_by_index(&mut self, index: usize, message: String) {
+        if let Some(&num) = self.active_write_disks.get(index) {
+            self.mark_failed_by_number(num, message);
+        } else if let Some((&num, _)) = self.devices.iter().nth(index) {
+            self.mark_failed_by_number(num, message);
         }
     }
 
@@ -345,6 +433,7 @@ impl AppState {
                 slot.progress = 0.0;
                 slot.bytes_written = 0;
                 slot.message.clear();
+                slot.retry_count = 0;
             } else if slot.status != SlotStatus::Failed {
                 slot.status = SlotStatus::Failed;
                 slot.message = "not opened for write".to_string();
@@ -368,12 +457,15 @@ impl AppState {
         self.write_started_at = None;
         self.write_rx = None;
         self.prepare_rx = None;
+        self.active_write_disks.clear();
+        self.single_retry_rxs.clear();
 
         for slot in self.devices.values_mut() {
             slot.status = SlotStatus::Waiting;
             slot.progress = 0.0;
             slot.bytes_written = 0;
             slot.message.clear();
+            slot.retry_count = 0;
         }
 
         self.recompute_status();
@@ -402,7 +494,7 @@ impl AppState {
     fn active_slots(&self) -> Vec<&DeviceSlot> {
         self.devices
             .values()
-            .filter(|s| matches!(s.status, SlotStatus::Writing | SlotStatus::Verifying))
+            .filter(|s| matches!(s.status, SlotStatus::Writing | SlotStatus::Verifying | SlotStatus::Retrying))
             .collect()
     }
 
@@ -592,6 +684,7 @@ impl AppState {
                     opened_numbers,
                     files_count,
                 }) => {
+                    self.active_write_disks = opened_numbers.clone();
                     self.mark_slots_writing(&opened_numbers);
                     self.write_started_at = Some(Instant::now());
                     self.push_log(format!("=== Writing to {} devices ===", files_count));
@@ -629,31 +722,42 @@ impl AppState {
         loop {
             match rx.try_recv() {
                 Ok(WriteEvent::Progress { id, bytes_written }) => {
-                    self.update_progress_by_index(id, bytes_written, self.write_total_bytes);
+                    if let Some(&num) = self.active_write_disks.get(id) {
+                        self.update_progress_by_number(num, bytes_written, self.write_total_bytes);
+                    } else {
+                        self.update_progress_by_index(id, bytes_written, self.write_total_bytes);
+                    }
                 }
                 Ok(WriteEvent::Completed { id }) => {
-                    self.mark_completed_by_index(id);
-                    self.push_log(format!("[{}] write complete", id));
+                    if let Some(&num) = self.active_write_disks.get(id) {
+                        self.mark_completed_by_number(num);
+                        self.push_log(format!("[#{}] write complete", num));
+                    } else {
+                        self.mark_completed_by_index(id);
+                        self.push_log(format!("[{}] write complete", id));
+                    }
                 }
                 Ok(WriteEvent::Errored { id, message }) => {
-                    self.mark_failed_by_index(id, message.clone());
-                    self.push_log(format!("[!] [{}] error: {}", id, message));
+                    let disk_num = self.active_write_disks.get(id).copied();
+                    if let Some(num) = disk_num {
+                        self.push_log(format!("[!] [#{}] error: {}", num, message));
+                        self.handle_write_error_for_device(num, message);
+                    } else {
+                        self.mark_failed_by_index(id, message.clone());
+                        self.push_log(format!("[!] [{}] error: {}", id, message));
+                    }
                 }
                 Ok(WriteEvent::Finished { result }) => {
                     match result {
-                        Ok(()) => self.push_log("=== Write complete ==="),
-                        Err(e) => self.push_log(format!("[!] Write finished with error: {}", e)),
+                        Ok(()) => self.push_log("=== Main batch write complete ==="),
+                        Err(e) => self.push_log(format!("[!] Main batch write error: {}", e)),
                     }
-                    self.return_devices_online();
-                    self.status = AppStatus::Finished;
                     keep = false;
                     break;
                 }
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => {
-                    self.push_log("[!] Write channel disconnected");
-                    self.return_devices_online();
-                    self.status = AppStatus::Finished;
+                    self.push_log("[!] Main write channel closed");
                     keep = false;
                     break;
                 }
@@ -662,12 +766,175 @@ impl AppState {
 
         if keep {
             self.write_rx = Some(rx);
+        } else {
+            self.auto_transition_finished();
         }
+    }
+
+    pub fn has_active_retries(&self) -> bool {
+        !self.single_retry_rxs.is_empty()
+            || self.devices.values().any(|s| s.status == SlotStatus::Retrying)
+    }
+
+    pub fn drain_single_retries(&mut self) {
+        if self.single_retry_rxs.is_empty() {
+            return;
+        }
+
+        let rxs = std::mem::take(&mut self.single_retry_rxs);
+        let mut events = Vec::new();
+        let mut alive_rxs = Vec::new();
+
+        for rx in rxs {
+            let mut keep = true;
+            loop {
+                match rx.try_recv() {
+                    Ok(ev) => {
+                        let is_terminal = matches!(
+                            ev,
+                            crate::engine::writer::SingleWriteEvent::Completed { .. }
+                                | crate::engine::writer::SingleWriteEvent::Failed { .. }
+                        );
+                        events.push(ev);
+                        if is_terminal {
+                            keep = false;
+                            break;
+                        }
+                    }
+                    Err(TryRecvError::Empty) => break,
+                    Err(TryRecvError::Disconnected) => {
+                        keep = false;
+                        break;
+                    }
+                }
+            }
+            if keep {
+                alive_rxs.push(rx);
+            }
+        }
+
+        self.single_retry_rxs = alive_rxs;
+
+        let mut to_retry = Vec::new();
+        for ev in events {
+            match ev {
+                crate::engine::writer::SingleWriteEvent::Log(msg) => self.push_log(msg),
+                crate::engine::writer::SingleWriteEvent::Status {
+                    disk_number,
+                    message,
+                } => {
+                    if let Some(slot) = self.devices.get_mut(&disk_number) {
+                        slot.message = message;
+                    }
+                }
+                crate::engine::writer::SingleWriteEvent::Progress {
+                    disk_number,
+                    bytes_written,
+                } => {
+                    self.update_progress_by_number(
+                        disk_number,
+                        bytes_written,
+                        self.write_total_bytes,
+                    );
+                }
+                crate::engine::writer::SingleWriteEvent::Completed { disk_number } => {
+                    self.mark_completed_by_number(disk_number);
+                }
+                crate::engine::writer::SingleWriteEvent::Failed {
+                    disk_number,
+                    message,
+                } => {
+                    to_retry.push((disk_number, message));
+                }
+            }
+        }
+
+        for (num, err) in to_retry {
+            self.handle_write_error_for_device(num, err);
+        }
+
+        self.auto_transition_finished();
+    }
+
+    pub fn handle_write_error_for_device(&mut self, disk_number: u32, message: String) {
+        let (should_retry, attempt, max) = if let Some(slot) = self.devices.get_mut(&disk_number) {
+            slot.retry_count += 1;
+            if slot.retry_count <= slot.max_retries {
+                slot.status = SlotStatus::Retrying;
+                slot.message = format!("Auto-retry ({}/{})…", slot.retry_count, slot.max_retries);
+                (true, slot.retry_count, slot.max_retries)
+            } else {
+                slot.status = SlotStatus::Failed;
+                slot.message = format!("Failed after {} retries: {}", slot.max_retries, message);
+                (false, slot.retry_count, slot.max_retries)
+            }
+        } else {
+            (false, 0, 0)
+        };
+
+        if should_retry {
+            self.push_log(format!(
+                "[#{}] Error: {}. Auto-retrying ({}/{}) without interrupting other drives…",
+                disk_number, message, attempt, max
+            ));
+            self.start_single_drive_retry(disk_number);
+        } else {
+            self.push_log(format!(
+                "[!] [#{}] Permanently failed after {} retries: {}",
+                disk_number, max, message
+            ));
+            self.auto_transition_finished();
+        }
+    }
+
+    pub fn start_single_drive_retry(&mut self, disk_number: u32) {
+        let Some(image_path) = self.image_path.as_ref().map(|p| p.display().to_string()) else {
+            return;
+        };
+        let total = self.write_total_bytes;
+        let attempt = self.devices.get(&disk_number).map(|s| s.retry_count).unwrap_or(1);
+        let max = self.devices.get(&disk_number).map(|s| s.max_retries).unwrap_or(3);
+
+        if let Some(slot) = self.devices.get_mut(&disk_number) {
+            slot.status = SlotStatus::Retrying;
+            slot.progress = 0.0;
+            slot.bytes_written = 0;
+            slot.message = format!("Retrying ({}/{})…", attempt, max);
+        }
+
+        let rx = crate::engine::writer::start_single_drive_write(
+            disk_number,
+            image_path,
+            total,
+            attempt,
+            max,
+        );
+        self.single_retry_rxs.push(rx);
+    }
+
+    pub fn manual_retry_device(&mut self, disk_number: u32) {
+        if let Some(slot) = self.devices.get_mut(&disk_number) {
+            slot.retry_count = 0;
+            slot.status = SlotStatus::Retrying;
+            slot.progress = 0.0;
+            slot.bytes_written = 0;
+            slot.message = "Manual retry started…".to_string();
+        }
+        if self.status == AppStatus::Finished {
+            self.status = AppStatus::Running;
+        }
+        self.push_log(format!("[#{}] Manual retry initiated by user", disk_number));
+        self.start_single_drive_retry(disk_number);
     }
 
     pub fn return_devices_online(&mut self) {
         let numbers: Vec<u32> = self.devices.keys().copied().collect();
         for n in numbers {
+            if let Some(slot) = self.devices.get(&n) {
+                if slot.status == SlotStatus::Retrying {
+                    continue;
+                }
+            }
             match crate::engine::set_disk_offline(n, false) {
                 Ok(()) => self.push_log(format!("[#{}] back online", n)),
                 Err(e) => self.push_log(format!("[#{}] failed to bring online: {}", n, e)),
@@ -679,6 +946,9 @@ impl AppState {
         if self.status != AppStatus::Running || self.devices.is_empty() {
             return;
         }
+        if self.write_rx.is_some() || self.prepare_rx.is_some() || self.has_active_retries() {
+            return;
+        }
         let all_done = self
             .devices
             .values()
@@ -686,6 +956,7 @@ impl AppState {
         if all_done {
             self.return_devices_online();
             self.status = AppStatus::Finished;
+            self.push_log("=== Flashing batch finished ===");
         }
     }
 

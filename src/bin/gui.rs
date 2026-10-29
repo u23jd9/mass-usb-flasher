@@ -109,6 +109,7 @@ struct MufGuiApp {
     show_help_modal: bool,
     show_file_picker_modal: bool,
     show_log_panel: bool,
+    log_autoscroll: bool,
     last_taskbar_update: Instant,
     last_taskbar_pct: i32,
 }
@@ -154,6 +155,7 @@ impl MufGuiApp {
             show_help_modal: false,
             show_file_picker_modal: false,
             show_log_panel: false,
+            log_autoscroll: true,
             last_taskbar_update: Instant::now(),
             last_taskbar_pct: -1,
         }
@@ -188,6 +190,7 @@ impl eframe::App for MufGuiApp {
         self.state.drain_import_job();
         self.state.drain_prepare();
         self.state.drain_write();
+        self.state.drain_single_retries();
         self.state.auto_transition_finished();
         self.update_taskbar();
 
@@ -200,6 +203,7 @@ impl eframe::App for MufGuiApp {
         if matches!(self.state.status, AppStatus::Running)
             || self.state.image_hash_progress.is_some()
             || self.state.import_job.is_some()
+            || self.state.has_active_retries()
         {
             ctx.request_repaint_after(Duration::from_millis(100));
         }
@@ -231,7 +235,7 @@ impl eframe::App for MufGuiApp {
                 self.render_image_card(ui);
             });
 
-        // --- НИЖНЯЯ ПАНЕЛЬ (Actions & Status) ---
+        // --- НИЖНЯЯ ПАНЕЛЬ ДЕЙСТВИЙ (Start, Reset, Help, Status) ---
         egui::TopBottomPanel::bottom("bottom_panel")
             .frame(
                 egui::Frame::none()
@@ -242,14 +246,27 @@ impl eframe::App for MufGuiApp {
                 self.render_bottom_bar(ui);
             });
 
+        // --- ПАНЕЛЬ ЛОГА (Activity Log: docked above bottom bar, resizable) ---
+        if self.show_log_panel {
+            egui::TopBottomPanel::bottom("log_panel")
+                .resizable(true)
+                .default_height(160.0)
+                .min_height(80.0)
+                .max_height(360.0)
+                .frame(
+                    egui::Frame::none()
+                        .fill(colors.card_bg)
+                        .stroke(Stroke::new(1.0_f32, colors.card_stroke))
+                        .inner_margin(8.0),
+                )
+                .show(ctx, |ui| {
+                    self.render_log_viewer(ui);
+                });
+        }
+
         // --- ЦЕНТРАЛЬНАЯ ПАНЕЛЬ (Таблица устройств) ---
         egui::CentralPanel::default().show(ctx, |ui| {
             self.render_devices_table(ui);
-
-            if self.show_log_panel {
-                ui.separator();
-                self.render_log_viewer(ui);
-            }
         });
 
         // --- МОДАЛЬНЫЕ ОКНА ---
@@ -502,9 +519,11 @@ impl MufGuiApp {
             return;
         }
 
+        let mut manual_retry_slot = None;
+
         // Таблица устройств
         egui::ScrollArea::vertical()
-            .max_height(340.0)
+            .auto_shrink([false, false])
             .show(ui, |ui| {
                 egui::Grid::new("devices_grid")
                     .striped(true)
@@ -531,6 +550,7 @@ impl MufGuiApp {
                                 SlotStatus::Formatting => (t.slot_formatting, Color32::from_rgb(255, 152, 0)),
                                 SlotStatus::Done => (t.slot_done, Color32::from_rgb(76, 175, 80)),
                                 SlotStatus::Failed => (t.slot_failed, Color32::from_rgb(244, 67, 54)),
+                                SlotStatus::Retrying => (t.slot_retrying, Color32::from_rgb(255, 179, 0)),
                             };
 
                             ui.label(RichText::new(format!("#{}", n)).strong());
@@ -551,12 +571,28 @@ impl MufGuiApp {
                                             .desired_width(160.0),
                                     );
                                 }
+                                SlotStatus::Retrying => {
+                                    ui.horizontal(|ui| {
+                                        ui.add(
+                                            egui::ProgressBar::new(slot.progress)
+                                                .text(format!("{:>5.1}%", slot.progress * 100.0))
+                                                .desired_width(120.0),
+                                        );
+                                        let msg = if slot.message.is_empty() { "Retrying…" } else { &slot.message };
+                                        ui.label(RichText::new(msg).color(Color32::from_rgb(255, 179, 0)).size(11.0));
+                                    });
+                                }
                                 SlotStatus::Done => {
                                     ui.label(RichText::new("100.0%  ✔").strong().color(Color32::from_rgb(76, 175, 80)));
                                 }
                                 SlotStatus::Failed => {
-                                    let msg = if slot.message.is_empty() { "ERROR" } else { &slot.message };
-                                    ui.label(RichText::new(msg).color(Color32::from_rgb(244, 67, 54)));
+                                    ui.horizontal(|ui| {
+                                        let msg = if slot.message.is_empty() { "ERROR" } else { &slot.message };
+                                        ui.label(RichText::new(msg).color(Color32::from_rgb(244, 67, 54)).size(11.0));
+                                        if ui.small_button("🔄 Retry").on_hover_text("Retry writing this flash drive individually").clicked() {
+                                            manual_retry_slot = Some(*n);
+                                        }
+                                    });
                                 }
                                 _ => {
                                     ui.label("—");
@@ -567,6 +603,10 @@ impl MufGuiApp {
                         }
                     });
             });
+
+        if let Some(disk_num) = manual_retry_slot {
+            self.state.manual_retry_device(disk_num);
+        }
     }
 
     fn render_bottom_bar(&mut self, ui: &mut egui::Ui) {
@@ -664,20 +704,42 @@ impl MufGuiApp {
     }
 
     fn render_log_viewer(&mut self, ui: &mut egui::Ui) {
-        ui.label(RichText::new(self.state.t().gui_title_log).strong().weak());
+        let t = self.state.t();
+        // Панель заголовка и управления логом
+        ui.horizontal(|ui| {
+            ui.label(RichText::new(format!("📜 {}", t.gui_title_log)).strong().size(13.0));
+            ui.label(RichText::new(format!("({} entries)", self.state.log.len())).weak().size(11.0));
+
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                if ui.small_button("✕ Close").clicked() {
+                    self.show_log_panel = false;
+                }
+                if ui.small_button(t.gui_log_clear).clicked() {
+                    self.state.log.clear();
+                }
+                ui.checkbox(&mut self.log_autoscroll, t.gui_log_autoscroll);
+            });
+        });
+
+        ui.add_space(2.0);
+
         egui::ScrollArea::vertical()
-            .max_height(120.0)
-            .stick_to_bottom(true)
+            .stick_to_bottom(self.log_autoscroll)
+            .auto_shrink([false, false])
             .show(ui, |ui| {
-                for line in self.state.log.iter().rev().take(30).collect::<Vec<_>>().into_iter().rev() {
-                    let color = if line.contains("[!]") || line.contains("error") {
+                for line in &self.state.log {
+                    let color = if line.contains("[!]") || line.contains("error") || line.contains("Failed") {
                         Color32::from_rgb(244, 67, 54)
-                    } else if line.contains("===") {
+                    } else if line.contains("===") || line.contains("Starting") || line.contains("Preparing") {
                         Color32::from_rgb(100, 200, 255)
+                    } else if line.contains("[+]") || line.contains("complete") || line.contains("succeeded") || line.contains("✔") {
+                        Color32::from_rgb(76, 175, 80)
+                    } else if line.contains("Retry") || line.contains("Reconnecting") || line.contains("Waiting") {
+                        Color32::from_rgb(255, 179, 0)
                     } else {
-                        Color32::from_rgb(180, 180, 190)
+                        Color32::from_rgb(180, 185, 195)
                     };
-                    ui.label(RichText::new(line).monospace().size(12.0).color(color));
+                    ui.label(RichText::new(line).monospace().size(11.5).color(color));
                 }
             });
     }
