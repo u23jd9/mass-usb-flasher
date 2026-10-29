@@ -1813,6 +1813,7 @@ dependencies = [
  "crossbeam",
  "eframe",
  "hex",
+ "image",
  "libc",
  "ratatui",
  "rfd",

@@ -100,6 +100,7 @@ pub enum SingleWriteEvent {
     Status { disk_number: u32, message: String },
     Completed { disk_number: u32 },
     Failed { disk_number: u32, message: String },
+    BeaconStarted { disk_number: u32 },
     Log(String),
 }
 
@@ -111,11 +112,20 @@ pub fn start_single_drive_write(
     total_bytes: u64,
     attempt: u32,
     max_retries: u32,
+    cancel_flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) -> Receiver<SingleWriteEvent> {
     let (tx, rx) = channel();
 
     thread::spawn(move || {
-        single_drive_worker(tx, disk_number, image_path, total_bytes, attempt, max_retries);
+        single_drive_worker(
+            tx,
+            disk_number,
+            image_path,
+            total_bytes,
+            attempt,
+            max_retries,
+            cancel_flag,
+        );
     });
 
     rx
@@ -128,16 +138,31 @@ fn single_drive_worker(
     total_bytes: u64,
     attempt: u32,
     max_retries: u32,
+    cancel_flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) {
+    use std::sync::atomic::Ordering;
+
+    if cancel_flag.load(Ordering::Relaxed) {
+        return;
+    }
+
     let _ = tx.send(SingleWriteEvent::Log(format!(
         "[#{}] Device auto-recovery: settling 1.5s before retry ({}/{})…",
         disk_number, attempt, max_retries
     )));
     thread::sleep(std::time::Duration::from_millis(1500));
 
+    if cancel_flag.load(Ordering::Relaxed) {
+        return;
+    }
+
     // Попытки переподключить и открыть устройство (до 5 попыток с интервалом 1 сек)
     let mut file = None;
     for i in 1..=5 {
+        if cancel_flag.load(Ordering::Relaxed) {
+            return;
+        }
+
         let _ = tx.send(SingleWriteEvent::Status {
             disk_number,
             message: format!("Reconnecting ({}/5)…", i),
@@ -170,6 +195,11 @@ fn single_drive_worker(
                 disk_number,
                 message: "Device reconnect timed out".to_string(),
             });
+
+            // Если попытки исчерпаны — переходим в режим активного маяка (мигаем светодиодом порта)
+            if attempt >= max_retries {
+                enter_beacon_mode(&tx, disk_number, &cancel_flag, "Device dropped & reconnect timed out");
+            }
             return;
         }
     };
@@ -201,25 +231,24 @@ fn single_drive_worker(
     let mut last_reported: u64 = 0;
 
     use io::{Read, Write};
+    let mut write_error = None;
     loop {
+        if cancel_flag.load(Ordering::Relaxed) {
+            return;
+        }
+
         let bytes_read = match reader.read(&mut buffer) {
             Ok(0) => break,
             Ok(n) => n,
             Err(e) => {
-                let _ = tx.send(SingleWriteEvent::Failed {
-                    disk_number,
-                    message: format!("Image read error: {}", e),
-                });
-                return;
+                write_error = Some(format!("Image read error: {}", e));
+                break;
             }
         };
 
         if let Err(e) = file.write_all(&buffer[..bytes_read]) {
-            let _ = tx.send(SingleWriteEvent::Failed {
-                disk_number,
-                message: format!("Write error: {}", e),
-            });
-            return;
+            write_error = Some(format!("Write error: {}", e));
+            break;
         }
 
         written += bytes_read as u64;
@@ -234,6 +263,21 @@ fn single_drive_worker(
         }
     }
 
+    if let Some(err) = write_error {
+        let _ = tx.send(SingleWriteEvent::Failed {
+            disk_number,
+            message: err.clone(),
+        });
+
+        // Если это повторная ошибка и лимит попыток исчерпан — активируем режим маяка
+        // для визуального поиска сбойной флешки на картридере
+        if attempt >= max_retries {
+            drop(file);
+            enter_beacon_mode(&tx, disk_number, &cancel_flag, &err);
+        }
+        return;
+    }
+
     let _ = crate::engine::flush_file(&file);
     crate::engine::update_disk_properties(&file);
     drop(file);
@@ -243,5 +287,43 @@ fn single_drive_worker(
     let _ = tx.send(SingleWriteEvent::Log(format!(
         "[#{}] Rewrite completed successfully! (attempt {}/{})",
         disk_number, attempt, max_retries
+    )));
+}
+
+/// Циклически отправляет короткие команды записи на сбойный диск, заставляя
+/// индикатор (LED) конкретного порта картридера активно мигать для оператора.
+fn enter_beacon_mode(
+    tx: &std::sync::mpsc::Sender<SingleWriteEvent>,
+    disk_number: u32,
+    cancel_flag: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+    error_reason: &str,
+) {
+    use std::sync::atomic::Ordering;
+
+    let _ = tx.send(SingleWriteEvent::BeaconStarted { disk_number });
+    let _ = tx.send(SingleWriteEvent::Status {
+        disk_number,
+        message: format!("🚨 BEACON: Reader LED blinking on this port! ({})", error_reason),
+    });
+    let _ = tx.send(SingleWriteEvent::Log(format!(
+        "[!] [#{}] BEACON ACTIVE: Drive repeatedly failed ({}). Reader port LED is actively blinking for visual identification. Unplug or click Stop.",
+        disk_number, error_reason
+    )));
+
+    let dummy = vec![0x55u8; 4096];
+    while !cancel_flag.load(Ordering::Relaxed) {
+        // Посылаем импульс записи, чтобы контроллер картридера зажёг/мигнул диодом
+        let _ = crate::engine::open_drive_write(disk_number).and_then(|mut f| {
+            use std::io::Write;
+            let _ = f.write_all(&dummy);
+            let _ = f.flush();
+            Ok(())
+        });
+        thread::sleep(std::time::Duration::from_millis(300));
+    }
+
+    let _ = tx.send(SingleWriteEvent::Log(format!(
+        "[#{}] Beacon stopped (unplugged or cancelled by operator).",
+        disk_number
     )));
 }

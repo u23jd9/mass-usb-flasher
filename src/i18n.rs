@@ -160,6 +160,13 @@ i18n! {
     gui_btn_retry = "🔄 Retry" / "🔄 Повторить",
     gui_log_clear = "🗑 Clear" / "🗑 Очистить",
     gui_log_autoscroll = "Auto-scroll" / "Автопрокрутка",
+    gui_sidebar_title = "Image Library" / "Библиотека образов",
+    gui_sidebar_toggle = "📁 Library" / "📁 Библиотека",
+    gui_btn_flash_single = "⚡ Flash" / "⚡ Записать",
+    gui_menu_flash_single = "⚡ Flash only this drive" / "⚡ Прошить только эту флешку",
+    gui_btn_stop_beacon = "⏹ Stop Beacon" / "⏹ Стоп маяк",
+    gui_autotarget_btn = "Auto" / "Авто",
+    gui_overall_progress = "Overall Progress" / "Общий прогресс",
 }
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

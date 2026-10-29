@@ -108,6 +108,7 @@ pub struct AppState {
     pub import_progress: Option<ImportProgress>,
 
     pub target_count: usize,
+    pub autotarget: bool,
     pub min_size_bytes: u64,
     pub max_size_bytes: u64,
 
@@ -116,6 +117,7 @@ pub struct AppState {
 
     pub active_write_disks: Vec<u32>,
     pub single_retry_rxs: Vec<Receiver<crate::engine::writer::SingleWriteEvent>>,
+    pub retry_cancel_flags: std::collections::HashMap<u32, std::sync::Arc<std::sync::atomic::AtomicBool>>,
 
     pub prepare_rx: Option<Receiver<PrepareResult>>,
     pub write_rx: Option<Receiver<WriteEvent>>,
@@ -160,6 +162,7 @@ impl Default for AppState {
             import_progress: None,
 
             target_count: 2,
+            autotarget: true,
             min_size_bytes: 4 * 1024 * 1024 * 1024,
             max_size_bytes: 128 * 1024 * 1024 * 1024,
 
@@ -168,6 +171,7 @@ impl Default for AppState {
 
             active_write_disks: Vec::new(),
             single_retry_rxs: Vec::new(),
+            retry_cancel_flags: std::collections::HashMap::new(),
 
             prepare_rx: None,
             write_rx: None,
@@ -211,6 +215,9 @@ impl AppState {
             DeviceEvent::Arrived(info) => self.on_device_arrived(info),
             DeviceEvent::Removed { number, path } => {
                 self.push_log(format!("[-] #{} {}", number, path));
+                if let Some(flag) = self.retry_cancel_flags.remove(&number) {
+                    flag.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
                 let is_active = self.status == AppStatus::Running
                     || self
                         .devices
@@ -297,6 +304,13 @@ impl AppState {
             return;
         }
 
+        if self.autotarget {
+            let have = self.devices.len();
+            if have > 0 {
+                self.target_count = have;
+            }
+        }
+
         let have = self.devices.len();
         let target = self.target_count;
 
@@ -354,6 +368,7 @@ impl AppState {
                         | SlotStatus::Formatting
                         | SlotStatus::Done
                         | SlotStatus::Failed
+                        | SlotStatus::Retrying
                 )
             })
             .count()
@@ -361,14 +376,22 @@ impl AppState {
 
     pub fn set_target_count(&mut self, n: usize) {
         self.target_count = n.clamp(TARGET_MIN, TARGET_MAX);
+        self.autotarget = false;
+        self.recompute_status();
+    }
+
+    pub fn enable_autotarget(&mut self) {
+        self.autotarget = true;
         self.recompute_status();
     }
 
     pub fn increase_target(&mut self) {
+        self.autotarget = false;
         self.set_target_count(self.target_count.saturating_add(1));
     }
 
     pub fn decrease_target(&mut self) {
+        self.autotarget = false;
         self.set_target_count(self.target_count.saturating_sub(1));
     }
 
@@ -491,7 +514,7 @@ impl AppState {
         self.write_started_at.map(|t| t.elapsed().as_secs_f64())
     }
 
-    fn active_slots(&self) -> Vec<&DeviceSlot> {
+    pub fn active_slots(&self) -> Vec<&DeviceSlot> {
         self.devices
             .values()
             .filter(|s| matches!(s.status, SlotStatus::Writing | SlotStatus::Verifying | SlotStatus::Retrying))
@@ -527,9 +550,39 @@ impl AppState {
         Some(avg as f64 / 1_048_576.0 / elapsed)
     }
 
-    #[allow(dead_code)]
     pub fn total_bytes_written(&self) -> u64 {
         self.devices.values().map(|s| s.bytes_written).sum()
+    }
+
+    pub fn total_target_bytes(&self) -> u64 {
+        let count = self
+            .devices
+            .values()
+            .filter(|s| {
+                matches!(
+                    s.status,
+                    SlotStatus::Writing
+                        | SlotStatus::Verifying
+                        | SlotStatus::Formatting
+                        | SlotStatus::Done
+                        | SlotStatus::Retrying
+                )
+            })
+            .count();
+        if count > 0 {
+            self.write_total_bytes * count as u64
+        } else {
+            self.write_total_bytes * self.target_count as u64
+        }
+    }
+
+    pub fn overall_progress_fraction(&self) -> f32 {
+        let total = self.total_target_bytes();
+        if total > 0 {
+            (self.total_bytes_written() as f32 / total as f32).clamp(0.0, 1.0)
+        } else {
+            0.0
+        }
     }
 
     pub fn select_image_from_catalog(&mut self, index: usize) -> Result<(), String> {
@@ -838,7 +891,14 @@ impl AppState {
                     );
                 }
                 crate::engine::writer::SingleWriteEvent::Completed { disk_number } => {
+                    self.retry_cancel_flags.remove(&disk_number);
                     self.mark_completed_by_number(disk_number);
+                }
+                crate::engine::writer::SingleWriteEvent::BeaconStarted { disk_number } => {
+                    if let Some(slot) = self.devices.get_mut(&disk_number) {
+                        slot.status = SlotStatus::Failed;
+                        slot.message = "🚨 Beacon active: LED blinking on card reader".to_string();
+                    }
                 }
                 crate::engine::writer::SingleWriteEvent::Failed {
                     disk_number,
@@ -859,14 +919,16 @@ impl AppState {
     pub fn handle_write_error_for_device(&mut self, disk_number: u32, message: String) {
         let (should_retry, attempt, max) = if let Some(slot) = self.devices.get_mut(&disk_number) {
             slot.retry_count += 1;
+            slot.bytes_written = 0;
+            slot.progress = 0.0;
             if slot.retry_count <= slot.max_retries {
                 slot.status = SlotStatus::Retrying;
                 slot.message = format!("Auto-retry ({}/{})…", slot.retry_count, slot.max_retries);
                 (true, slot.retry_count, slot.max_retries)
             } else {
                 slot.status = SlotStatus::Failed;
-                slot.message = format!("Failed after {} retries: {}", slot.max_retries, message);
-                (false, slot.retry_count, slot.max_retries)
+                slot.message = format!("Failed ({} retries): {}", slot.max_retries, message);
+                (true, slot.retry_count, slot.max_retries)
             }
         } else {
             (false, 0, 0)
@@ -874,7 +936,7 @@ impl AppState {
 
         if should_retry {
             self.push_log(format!(
-                "[#{}] Error: {}. Auto-retrying ({}/{}) without interrupting other drives…",
+                "[#{}] Error: {}. Starting isolated retry ({}/{})…",
                 disk_number, message, attempt, max
             ));
             self.start_single_drive_retry(disk_number);
@@ -902,14 +964,62 @@ impl AppState {
             slot.message = format!("Retrying ({}/{})…", attempt, max);
         }
 
+        let cancel_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        self.retry_cancel_flags.insert(disk_number, cancel_flag.clone());
+
         let rx = crate::engine::writer::start_single_drive_write(
             disk_number,
             image_path,
             total,
             attempt,
             max,
+            cancel_flag,
         );
         self.single_retry_rxs.push(rx);
+    }
+
+    pub fn stop_beacon(&mut self, disk_number: u32) {
+        if let Some(flag) = self.retry_cancel_flags.remove(&disk_number) {
+            flag.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        if let Some(slot) = self.devices.get_mut(&disk_number) {
+            slot.message = "Beacon stopped".to_string();
+            slot.status = SlotStatus::Failed;
+        }
+        self.push_log(format!("[#{}] Beacon stopped by user", disk_number));
+        self.auto_transition_finished();
+    }
+
+    pub fn flash_single_device(&mut self, disk_number: u32) {
+        if self.image_path.is_none() {
+            self.push_log("[!] Select an image first");
+            return;
+        }
+        if self.image_sha256.is_none() {
+            self.push_log("[!] SHA-256 not yet computed");
+            return;
+        }
+        if self.status == AppStatus::Running {
+            self.push_log("[!] An operation is already in progress");
+            return;
+        }
+
+        let Some(slot) = self.devices.get_mut(&disk_number) else {
+            return;
+        };
+
+        slot.status = SlotStatus::Writing;
+        slot.progress = 0.0;
+        slot.bytes_written = 0;
+        slot.retry_count = 0;
+        slot.message = "Flashing single drive…".to_string();
+
+        self.status = AppStatus::Running;
+        self.write_total_bytes = self.image_size;
+        self.write_started_at = Some(Instant::now());
+        self.push_log(format!("[#{}] Starting dedicated flashing for single drive…", disk_number));
+
+        self.start_single_drive_retry(disk_number);
     }
 
     pub fn manual_retry_device(&mut self, disk_number: u32) {

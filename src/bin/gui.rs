@@ -78,6 +78,21 @@ impl GuiTheme {
     }
 }
 
+fn load_app_icon() -> Option<egui::IconData> {
+    let png_bytes = include_bytes!("../../icon.png");
+    if let Ok(img) = image::load_from_memory(png_bytes) {
+        let rgba = img.to_rgba8();
+        let (width, height) = rgba.dimensions();
+        Some(egui::IconData {
+            rgba: rgba.into_raw(),
+            width,
+            height,
+        })
+    } else {
+        None
+    }
+}
+
 fn main() -> eframe::Result<()> {
     if !ensure_elevated(true) {
         std::process::exit(1);
@@ -85,11 +100,17 @@ fn main() -> eframe::Result<()> {
 
     let _ = ensure_automount_enabled();
 
+    let mut viewport = egui::ViewportBuilder::default()
+        .with_title("Mass USB Flasher")
+        .with_inner_size([1080.0, 720.0])
+        .with_min_inner_size([900.0, 560.0]);
+
+    if let Some(icon) = load_app_icon() {
+        viewport = viewport.with_icon(icon);
+    }
+
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_title("Mass USB Flasher")
-            .with_inner_size([1040.0, 720.0])
-            .with_min_inner_size([880.0, 540.0]),
+        viewport,
         ..Default::default()
     };
 
@@ -98,6 +119,16 @@ fn main() -> eframe::Result<()> {
         options,
         Box::new(|cc| Ok(Box::new(MufGuiApp::new(cc)))),
     )
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UiScaleMode {
+    Auto,
+    Scale100,
+    Scale125,
+    Scale150,
+    Scale175,
+    Scale200,
 }
 
 struct MufGuiApp {
@@ -110,6 +141,10 @@ struct MufGuiApp {
     show_file_picker_modal: bool,
     show_log_panel: bool,
     log_autoscroll: bool,
+    ui_scale_mode: UiScaleMode,
+    current_zoom: f32,
+    show_images_sidebar: bool,
+    sidebar_search: String,
     last_taskbar_update: Instant,
     last_taskbar_pct: i32,
 }
@@ -156,6 +191,10 @@ impl MufGuiApp {
             show_file_picker_modal: false,
             show_log_panel: false,
             log_autoscroll: true,
+            ui_scale_mode: UiScaleMode::Auto,
+            current_zoom: 1.0,
+            show_images_sidebar: true,
+            sidebar_search: String::new(),
             last_taskbar_update: Instant::now(),
             last_taskbar_pct: -1,
         }
@@ -184,6 +223,38 @@ impl MufGuiApp {
 
 impl eframe::App for MufGuiApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Адаптивное масштабирование интерфейса
+        let (viewport_w, viewport_h) = {
+            let rect = ctx.screen_rect();
+            (rect.width(), rect.height())
+        };
+
+        let desired_zoom = match self.ui_scale_mode {
+            UiScaleMode::Auto => {
+                let phys_w = viewport_w * self.current_zoom;
+                let phys_h = viewport_h * self.current_zoom;
+                if phys_w >= 2400.0 || phys_h >= 1350.0 {
+                    1.6
+                } else if phys_w >= 1800.0 || phys_h >= 1000.0 {
+                    1.3
+                } else if phys_w >= 1400.0 || phys_h >= 850.0 {
+                    1.15
+                } else {
+                    1.0
+                }
+            }
+            UiScaleMode::Scale100 => 1.0,
+            UiScaleMode::Scale125 => 1.25,
+            UiScaleMode::Scale150 => 1.5,
+            UiScaleMode::Scale175 => 1.75,
+            UiScaleMode::Scale200 => 2.0,
+        };
+
+        if (desired_zoom - self.current_zoom).abs() > 0.02 {
+            self.current_zoom = desired_zoom;
+            ctx.set_zoom_factor(desired_zoom);
+        }
+
         // Фоновая обработка очередей
         self.state.drain_device_events(&self.watcher);
         self.state.drain_hash_job();
@@ -264,6 +335,24 @@ impl eframe::App for MufGuiApp {
                 });
         }
 
+        // --- САЙД-ПАНЕЛЬ БИБЛИОТЕКИ ОБРАЗОВ (Коллапсируемая панель слева) ---
+        if self.show_images_sidebar {
+            egui::SidePanel::left("images_sidebar_panel")
+                .resizable(true)
+                .default_width(280.0)
+                .min_width(220.0)
+                .max_width(450.0)
+                .frame(
+                    egui::Frame::none()
+                        .fill(colors.card_bg)
+                        .stroke(Stroke::new(1.0_f32, colors.card_stroke))
+                        .inner_margin(10.0),
+                )
+                .show(ctx, |ui| {
+                    self.render_images_sidebar(ui);
+                });
+        }
+
         // --- ЦЕНТРАЛЬНАЯ ПАНЕЛЬ (Таблица устройств) ---
         egui::CentralPanel::default().show(ctx, |ui| {
             self.render_devices_table(ui);
@@ -295,7 +384,21 @@ impl MufGuiApp {
             );
             ui.label(RichText::new(format!("v{}", VERSION)).weak());
 
-            ui.add_space(16.0);
+            ui.add_space(8.0);
+
+            // Кнопка переключения сайдбара библиотеки образов
+            if ui
+                .selectable_label(
+                    self.show_images_sidebar,
+                    RichText::new(format!("{} ({})", t.gui_sidebar_toggle, self.state.catalog.images.len()))
+                        .strong(),
+                )
+                .clicked()
+            {
+                self.show_images_sidebar = !self.show_images_sidebar;
+            }
+
+            ui.add_space(10.0);
 
             // Статус-бейдж
             let (status_text, bg_color, fg_color) = match self.state.status {
@@ -330,8 +433,8 @@ impl MufGuiApp {
                     ui.label(RichText::new(status_text).strong().color(fg_color));
                 });
 
-            // Управление целевым количеством
-            ui.add_space(20.0);
+            // Управление целевым количеством + Автотаргет
+            ui.add_space(16.0);
             ui.label(RichText::new(t.lbl_target).strong());
             if ui.button("➖").clicked() {
                 self.state.decrease_target();
@@ -346,7 +449,20 @@ impl MufGuiApp {
                 self.state.increase_target();
             }
 
-            // Переключатели темы и языка
+            let auto_color = if self.state.autotarget {
+                Color32::from_rgb(76, 175, 80)
+            } else {
+                Color32::from_rgb(130, 135, 145)
+            };
+            if ui
+                .small_button(RichText::new(format!("[{}]", t.gui_autotarget_btn)).color(auto_color).strong())
+                .on_hover_text("Auto-target: matches total connected USB drives automatically")
+                .clicked()
+            {
+                self.state.enable_autotarget();
+            }
+
+            // Переключатели масштаба (Autoscaling), темы и языка
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 if ui
                     .button(
@@ -369,6 +485,24 @@ impl MufGuiApp {
                     };
                     ui.ctx().set_visuals(self.theme.visuals());
                 }
+
+                egui::ComboBox::from_id_salt("ui_scale_selector")
+                    .selected_text(match self.ui_scale_mode {
+                        UiScaleMode::Auto => format!("🔍 Auto ({:.0}%)", self.current_zoom * 100.0),
+                        UiScaleMode::Scale100 => "🔍 100%".into(),
+                        UiScaleMode::Scale125 => "🔍 125%".into(),
+                        UiScaleMode::Scale150 => "🔍 150%".into(),
+                        UiScaleMode::Scale175 => "🔍 175%".into(),
+                        UiScaleMode::Scale200 => "🔍 200%".into(),
+                    })
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(&mut self.ui_scale_mode, UiScaleMode::Auto, "Auto (Adaptive)");
+                        ui.selectable_value(&mut self.ui_scale_mode, UiScaleMode::Scale100, "100%");
+                        ui.selectable_value(&mut self.ui_scale_mode, UiScaleMode::Scale125, "125%");
+                        ui.selectable_value(&mut self.ui_scale_mode, UiScaleMode::Scale150, "150%");
+                        ui.selectable_value(&mut self.ui_scale_mode, UiScaleMode::Scale175, "175%");
+                        ui.selectable_value(&mut self.ui_scale_mode, UiScaleMode::Scale200, "200%");
+                    });
             });
         });
     }
@@ -419,10 +553,6 @@ impl MufGuiApp {
                         if ui.button(t.gui_btn_open_once).clicked() {
                             if let Some(path) = mass_usb_flasher::picker::pick_image_file() {
                                 self.state.select_image_path(path, false);
-                            } else {
-                                self.state.file_picker_mode = mass_usb_flasher::app::FilePickerMode::OpenOnce;
-                                self.state.refresh_file_picker_entries();
-                                self.show_file_picker_modal = true;
                             }
                         }
                         if ui.button(t.gui_btn_catalog).clicked() {
@@ -434,10 +564,6 @@ impl MufGuiApp {
                         {
                             if let Some(path) = mass_usb_flasher::picker::pick_image_file() {
                                 self.state.select_image_path(path, true);
-                            } else {
-                                self.state.file_picker_mode = mass_usb_flasher::app::FilePickerMode::AddImage;
-                                self.state.refresh_file_picker_entries();
-                                self.show_file_picker_modal = true;
                             }
                         }
                     });
@@ -477,6 +603,149 @@ impl MufGuiApp {
                     }
                 });
             });
+    }
+
+    fn render_images_sidebar(&mut self, ui: &mut egui::Ui) {
+        let t = self.state.t();
+        let colors = self.theme.colors();
+
+        ui.horizontal(|ui| {
+            ui.heading(RichText::new(t.gui_sidebar_title).size(15.0).strong());
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                if ui.small_button("✕").on_hover_text("Hide sidebar").clicked() {
+                    self.show_images_sidebar = false;
+                }
+            });
+        });
+
+        ui.add_space(4.0);
+
+        ui.horizontal(|ui| {
+            if ui.button("➕ Add...").clicked() {
+                if let Some(path) = mass_usb_flasher::picker::pick_image_file() {
+                    self.state.select_image_path(path, true);
+                }
+            }
+            if ui.button("📂 Folder...").clicked() {
+                if let Some(folder) = mass_usb_flasher::picker::pick_image_folder() {
+                    self.state.apply_import_folder(folder);
+                }
+            }
+        });
+
+        ui.add_space(6.0);
+        ui.add(
+            egui::TextEdit::singleline(&mut self.sidebar_search)
+                .hint_text("🔍 Search images…")
+                .desired_width(ui.available_width()),
+        );
+
+        ui.add_space(6.0);
+        ui.separator();
+
+        let search = self.sidebar_search.to_lowercase();
+        let current_path = self.state.image_path.clone();
+
+        let mut to_select_index = None;
+        let mut to_delete_index = None;
+
+        egui::ScrollArea::vertical()
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                if self.state.catalog.images.is_empty() {
+                    ui.add_space(20.0);
+                    ui.vertical_centered(|ui| {
+                        ui.label(RichText::new("📁").size(28.0).weak());
+                        ui.add_space(4.0);
+                        ui.label(
+                            RichText::new("No images in library.\nClick 'Add' or drag-and-drop file here.")
+                                .weak()
+                                .size(12.0),
+                        );
+                    });
+                    return;
+                }
+
+                for (idx, entry) in self.state.catalog.images.iter().enumerate() {
+                    if !search.is_empty()
+                        && !entry.work_name.to_lowercase().contains(&search)
+                        && !entry.path.to_string_lossy().to_lowercase().contains(&search)
+                    {
+                        continue;
+                    }
+
+                    let is_selected = current_path.as_ref() == Some(&entry.path);
+                    let stroke_color = if is_selected {
+                        Color32::from_rgb(33, 150, 243)
+                    } else {
+                        colors.card_stroke
+                    };
+                    let bg_color = if is_selected {
+                        Color32::from_rgb(28, 45, 65)
+                    } else {
+                        colors.empty_box_bg
+                    };
+
+                    egui::Frame::none()
+                        .fill(bg_color)
+                        .stroke(Stroke::new(if is_selected { 1.5_f32 } else { 1.0_f32 }, stroke_color))
+                        .rounding(Rounding::same(6.0))
+                        .inner_margin(8.0)
+                        .show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                let name_label = ui.add(
+                                    egui::Label::new(
+                                        RichText::new(&entry.work_name)
+                                            .strong()
+                                            .size(13.0)
+                                            .color(if is_selected {
+                                                Color32::from_rgb(100, 200, 255)
+                                            } else {
+                                                colors.text_primary
+                                            }),
+                                    )
+                                    .sense(egui::Sense::click()),
+                                );
+                                if name_label.clicked() {
+                                    to_select_index = Some(idx);
+                                }
+
+                                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                    if ui.small_button("🗑").on_hover_text("Delete from catalog").clicked() {
+                                        to_delete_index = Some(idx);
+                                    }
+                                    if is_selected {
+                                        ui.label(RichText::new("✔").color(Color32::from_rgb(76, 175, 80)).strong());
+                                    }
+                                });
+                            });
+
+                            let gb = entry.size_bytes as f64 / 1e9;
+                            ui.horizontal(|ui| {
+                                ui.label(RichText::new(format!("{:.2} GB", gb)).weak().size(11.0));
+                                if entry.sha256.len() >= 8 {
+                                    ui.label(RichText::new(format!("SHA: {}…", &entry.sha256[..8])).weak().size(11.0));
+                                }
+                            });
+
+                            let btn_text = if is_selected { "✔ Active" } else { "Select" };
+                            if ui.button(btn_text).clicked() {
+                                to_select_index = Some(idx);
+                            }
+                        });
+                    ui.add_space(4.0);
+                }
+            });
+
+        if let Some(idx) = to_select_index {
+            let _ = self.state.select_image_from_catalog(idx);
+        }
+        if let Some(idx) = to_delete_index {
+            if idx < self.state.catalog.images.len() {
+                self.state.catalog.images.remove(idx);
+                let _ = self.state.catalog.save(&self.state.catalog_path);
+            }
+        }
     }
 
     fn render_devices_table(&mut self, ui: &mut egui::Ui) {
@@ -520,6 +789,8 @@ impl MufGuiApp {
         }
 
         let mut manual_retry_slot = None;
+        let mut flash_single_slot = None;
+        let mut stop_beacon_slot = None;
 
         // Таблица устройств
         egui::ScrollArea::vertical()
@@ -538,6 +809,7 @@ impl MufGuiApp {
                         ui.label(RichText::new(t.th_serial).strong().weak());
                         ui.label(RichText::new(t.th_status).strong().weak());
                         ui.label(RichText::new(t.th_progress).strong().weak());
+                        ui.label(RichText::new("Actions").strong().weak());
                         ui.end_row();
 
                         for (n, slot) in &self.state.devices {
@@ -553,8 +825,28 @@ impl MufGuiApp {
                                 SlotStatus::Retrying => (t.slot_retrying, Color32::from_rgb(255, 179, 0)),
                             };
 
-                            ui.label(RichText::new(format!("#{}", n)).strong());
-                            ui.label(RichText::new(&slot.info.path).monospace());
+                            let id_lbl = ui.add(
+                                egui::Label::new(RichText::new(format!("#{}", n)).strong())
+                                    .sense(egui::Sense::click()),
+                            );
+                            id_lbl.context_menu(|ui| {
+                                if ui.button(t.gui_menu_flash_single).clicked() {
+                                    flash_single_slot = Some(*n);
+                                    ui.close_menu();
+                                }
+                            });
+
+                            let path_lbl = ui.add(
+                                egui::Label::new(RichText::new(&slot.info.path).monospace())
+                                    .sense(egui::Sense::click()),
+                            );
+                            path_lbl.context_menu(|ui| {
+                                if ui.button(t.gui_menu_flash_single).clicked() {
+                                    flash_single_slot = Some(*n);
+                                    ui.close_menu();
+                                }
+                            });
+
                             ui.label(format!("{:.2} GB", gb));
                             ui.label(&slot.info.product);
                             ui.label(RichText::new(&slot.info.serial).weak());
@@ -568,7 +860,7 @@ impl MufGuiApp {
                                     ui.add(
                                         egui::ProgressBar::new(slot.progress)
                                             .text(format!("{:>5.1}%", slot.progress * 100.0))
-                                            .desired_width(160.0),
+                                            .desired_width(140.0),
                                     );
                                 }
                                 SlotStatus::Retrying => {
@@ -576,7 +868,7 @@ impl MufGuiApp {
                                         ui.add(
                                             egui::ProgressBar::new(slot.progress)
                                                 .text(format!("{:>5.1}%", slot.progress * 100.0))
-                                                .desired_width(120.0),
+                                                .desired_width(110.0),
                                         );
                                         let msg = if slot.message.is_empty() { "Retrying…" } else { &slot.message };
                                         ui.label(RichText::new(msg).color(Color32::from_rgb(255, 179, 0)).size(11.0));
@@ -586,63 +878,147 @@ impl MufGuiApp {
                                     ui.label(RichText::new("100.0%  ✔").strong().color(Color32::from_rgb(76, 175, 80)));
                                 }
                                 SlotStatus::Failed => {
-                                    ui.horizontal(|ui| {
-                                        let msg = if slot.message.is_empty() { "ERROR" } else { &slot.message };
-                                        ui.label(RichText::new(msg).color(Color32::from_rgb(244, 67, 54)).size(11.0));
-                                        if ui.small_button("🔄 Retry").on_hover_text("Retry writing this flash drive individually").clicked() {
-                                            manual_retry_slot = Some(*n);
-                                        }
-                                    });
+                                    let msg = if slot.message.is_empty() { "ERROR" } else { &slot.message };
+                                    ui.label(RichText::new(msg).color(Color32::from_rgb(244, 67, 54)).size(11.0));
                                 }
                                 _ => {
                                     ui.label("—");
                                 }
                             }
 
+                            // Колонка действий
+                            ui.horizontal(|ui| {
+                                match slot.status {
+                                    SlotStatus::Failed => {
+                                        if slot.message.contains("Beacon") || slot.message.contains("BEACON") {
+                                            if ui.small_button(RichText::new(t.gui_btn_stop_beacon).color(Color32::from_rgb(255, 100, 100))).on_hover_text("Stop beacon blinking on card reader").clicked() {
+                                                stop_beacon_slot = Some(*n);
+                                            }
+                                        } else if ui.small_button(t.gui_btn_retry).on_hover_text("Retry writing this flash drive individually").clicked() {
+                                            manual_retry_slot = Some(*n);
+                                        }
+                                    }
+                                    SlotStatus::Retrying => {
+                                        if ui.small_button("⏹ Cancel").clicked() {
+                                            stop_beacon_slot = Some(*n);
+                                        }
+                                    }
+                                    SlotStatus::Ready | SlotStatus::Waiting => {
+                                        if self.state.status != AppStatus::Running {
+                                            if ui.small_button(RichText::new(t.gui_btn_flash_single).color(Color32::from_rgb(100, 200, 255))).on_hover_text("Flash only this drive").clicked() {
+                                                flash_single_slot = Some(*n);
+                                            }
+                                        }
+                                    }
+                                    _ => {}
+                                }
+                            });
+
                             ui.end_row();
                         }
                     });
             });
 
+        if let Some(disk_num) = flash_single_slot {
+            self.state.flash_single_device(disk_num);
+        }
         if let Some(disk_num) = manual_retry_slot {
             self.state.manual_retry_device(disk_num);
+        }
+        if let Some(disk_num) = stop_beacon_slot {
+            self.state.stop_beacon(disk_num);
         }
     }
 
     fn render_bottom_bar(&mut self, ui: &mut egui::Ui) {
         let t = self.state.t();
 
-        // Строка времени и скорости во время или после записи
+        // 1. OVERALL PROGRESS & ANIMATED COMPLETION BANNER
         if self.state.status == AppStatus::Finished {
-            ui.horizontal(|ui| {
-                ui.label(
-                    RichText::new(format!("🎉 {}", t.gui_all_done))
-                        .strong()
-                        .size(15.0)
-                        .color(Color32::from_rgb(186, 104, 200)),
-                );
-                if let Some(elapsed) = self.state.elapsed_secs() {
-                    ui.label(RichText::new(format!("({}: {})", t.lbl_elapsed, format_elapsed(elapsed))).weak());
-                }
-            });
-            ui.add_space(4.0);
-        } else if let Some(elapsed) = self.state.elapsed_secs() {
-            let speed = self
+            let time = ui.input(|i| i.time);
+            ui.ctx().request_repaint_after(Duration::from_millis(50));
+            let pulse = ((time * 4.0).sin() * 0.5 + 0.5) as f32;
+
+            let r = (34.0 * (1.0 - pulse) + 255.0 * pulse) as u8;
+            let g = (180.0 * (1.0 - pulse) + 215.0 * pulse) as u8;
+            let b = (76.0 * (1.0 - pulse) + 0.0 * pulse) as u8;
+            let banner_color = Color32::from_rgb(r, g, b);
+
+            egui::Frame::none()
+                .fill(banner_color)
+                .rounding(Rounding::same(6.0))
+                .inner_margin(egui::Margin::symmetric(14.0, 7.0))
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            RichText::new("🎉 FLASHING COMPLETE! ALL TARGET FLASH DRIVES READY ✔")
+                                .strong()
+                                .size(15.0)
+                                .color(Color32::BLACK),
+                        );
+                        if let Some(elapsed) = self.state.elapsed_secs() {
+                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                ui.label(
+                                    RichText::new(format!("Elapsed: {}", format_elapsed(elapsed)))
+                                        .strong()
+                                        .color(Color32::BLACK),
+                                );
+                            });
+                        }
+                    });
+                });
+            ui.add_space(6.0);
+        } else if self.state.status == AppStatus::Running {
+            let overall_pct = self.state.overall_progress_fraction();
+            let total_target = self.state.total_target_bytes();
+            let written = self.state.total_bytes_written();
+            let remaining = total_target.saturating_sub(written);
+
+            let speed_str = self
                 .state
                 .per_device_speed_mbps()
-                .map(|s| format!("{:.1} {}", s, t.speed_per_device))
-                .unwrap_or_else(|| "—".to_string());
-            let avg_bytes = self.state.average_bytes_written();
-            let total = self.state.write_total_bytes;
+                .map(|s| format!("{:.1} MB/s/drive", s))
+                .unwrap_or_else(|| "calculating…".to_string());
+
+            let eta_str = if let Some(speed_mbps) = self.state.per_device_speed_mbps() {
+                let active_count = self.state.active_slots().len().max(1);
+                let total_speed_bytes = speed_mbps * 1_048_576.0 * active_count as f64;
+                if total_speed_bytes > 0.0 {
+                    let secs = remaining as f64 / total_speed_bytes;
+                    format_elapsed(secs)
+                } else {
+                    "—".to_string()
+                }
+            } else {
+                "calculating…".to_string()
+            };
 
             ui.horizontal(|ui| {
-                ui.label(RichText::new(format!("{}: {}", t.lbl_elapsed, format_elapsed(elapsed))).weak());
+                ui.label(RichText::new(format!("📊 {}:", t.gui_overall_progress)).strong().size(13.0));
+                ui.label(
+                    RichText::new(format!("{:.1}%", overall_pct * 100.0))
+                        .strong()
+                        .size(13.0)
+                        .color(Color32::from_rgb(100, 200, 255)),
+                );
+                ui.label(RichText::new(format!("({:.2} / {:.2} GB)", written as f64 / 1e9, total_target as f64 / 1e9)).weak());
                 ui.separator();
-                ui.label(RichText::new(format!("{}: {}", t.lbl_speed, speed)).color(Color32::from_rgb(33, 150, 243)));
+                ui.label(RichText::new(format!("⚡ {}", speed_str)).color(Color32::from_rgb(33, 150, 243)));
                 ui.separator();
-                ui.label(RichText::new(format!("{}: {:.2} / {:.2} GB", t.lbl_written, avg_bytes as f64 / 1e9, total as f64 / 1e9)).weak());
+                ui.label(RichText::new(format!("⏳ ETA: {}", eta_str)).color(Color32::from_rgb(255, 193, 7)));
+                if let Some(elapsed) = self.state.elapsed_secs() {
+                    ui.separator();
+                    ui.label(RichText::new(format!("Elapsed: {}", format_elapsed(elapsed))).weak());
+                }
             });
-            ui.add_space(4.0);
+            ui.add_space(2.0);
+            ui.add(
+                egui::ProgressBar::new(overall_pct)
+                    .desired_height(16.0)
+                    .animate(true)
+                    .text(format!("{:>5.1}%", overall_pct * 100.0)),
+            );
+            ui.add_space(6.0);
         }
 
         // КНОПКИ ДЕЙСТВИЙ
@@ -761,19 +1137,11 @@ impl MufGuiApp {
                     if ui.button(t.cat_hint_a).clicked() {
                         if let Some(path) = mass_usb_flasher::picker::pick_image_file() {
                             self.state.select_image_path(path, true);
-                        } else {
-                            self.state.file_picker_mode = mass_usb_flasher::app::FilePickerMode::AddImage;
-                            self.state.refresh_file_picker_entries();
-                            self.show_file_picker_modal = true;
                         }
                     }
                     if ui.button(t.cat_hint_f).clicked() {
                         if let Some(folder) = mass_usb_flasher::picker::pick_image_folder() {
                             self.state.apply_import_folder(folder);
-                        } else {
-                            self.state.file_picker_mode = mass_usb_flasher::app::FilePickerMode::ImportFolder;
-                            self.state.refresh_file_picker_entries();
-                            self.show_file_picker_modal = true;
                         }
                     }
                 });
