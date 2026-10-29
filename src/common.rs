@@ -23,6 +23,145 @@ pub fn is_admin() -> bool {
     unsafe { libc::geteuid() == 0 }
 }
 
+/// Applies environment variables passed during self-elevation.
+pub fn handle_elevation_args() {
+    let args: Vec<String> = std::env::args().collect();
+    let mut i = 1;
+    while i < args.len() {
+        if args[i] == "--env-wayland-display" && i + 1 < args.len() {
+            std::env::set_var("WAYLAND_DISPLAY", &args[i + 1]);
+            i += 1;
+        } else if args[i] == "--env-xdg-runtime-dir" && i + 1 < args.len() {
+            std::env::set_var("XDG_RUNTIME_DIR", &args[i + 1]);
+            i += 1;
+        } else if args[i] == "--env-display" && i + 1 < args.len() {
+            std::env::set_var("DISPLAY", &args[i + 1]);
+            i += 1;
+        } else if args[i] == "--env-xauthority" && i + 1 < args.len() {
+            std::env::set_var("XAUTHORITY", &args[i + 1]);
+            i += 1;
+        } else if args[i] == "--env-user" && i + 1 < args.len() {
+            std::env::set_var("SUDO_USER", &args[i + 1]);
+            i += 1;
+        } else if args[i] == "--env-dbus-session" && i + 1 < args.len() {
+            std::env::set_var("DBUS_SESSION_BUS_ADDRESS", &args[i + 1]);
+            i += 1;
+        }
+        i += 1;
+    }
+}
+
+/// Ensures the current process runs with administrative / root privileges.
+/// If not, it requests elevation (via Polkit / pkexec in GUI or sudo in terminal).
+#[cfg(not(windows))]
+pub fn ensure_elevated(is_gui: bool) -> bool {
+    handle_elevation_args();
+
+    if is_admin() {
+        return true;
+    }
+
+    if std::env::args().any(|a| a == "--elevated-attempt") {
+        eprintln!("[!] Administrator/root rights are required to access disk devices.");
+        return false;
+    }
+
+    let exe = match std::env::current_exe() {
+        Ok(e) => e,
+        Err(e) => {
+            eprintln!("[!] Failed to determine current executable: {}", e);
+            return false;
+        }
+    };
+
+    // Allow root to access X11 / Xwayland display if DISPLAY is set
+    if std::env::var_os("DISPLAY").is_some() {
+        let _ = std::process::Command::new("xhost")
+            .arg("+SI:localuser:root")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+    }
+
+    let mut child_args = Vec::new();
+    child_args.push("--elevated-attempt".to_string());
+
+    if let Ok(w) = std::env::var("WAYLAND_DISPLAY") {
+        child_args.push("--env-wayland-display".to_string());
+        child_args.push(w);
+    }
+    if let Ok(r) = std::env::var("XDG_RUNTIME_DIR") {
+        child_args.push("--env-xdg-runtime-dir".to_string());
+        child_args.push(r);
+    }
+    if let Ok(d) = std::env::var("DISPLAY") {
+        child_args.push("--env-display".to_string());
+        child_args.push(d);
+    }
+    if let Ok(x) = std::env::var("XAUTHORITY") {
+        child_args.push("--env-xauthority".to_string());
+        child_args.push(x);
+    }
+    if let Ok(b) = std::env::var("DBUS_SESSION_BUS_ADDRESS") {
+        child_args.push("--env-dbus-session".to_string());
+        child_args.push(b);
+    }
+    if let Ok(u) = std::env::var("USER") {
+        child_args.push("--env-user".to_string());
+        child_args.push(u);
+    }
+
+    for arg in std::env::args().skip(1) {
+        if !arg.starts_with("--env-") && arg != "--elevated-attempt" {
+            child_args.push(arg);
+        }
+    }
+
+    let is_terminal = unsafe { libc::isatty(libc::STDIN_FILENO) == 1 };
+    let has_pkexec = std::process::Command::new("which")
+        .arg("pkexec")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+
+    let status = if has_pkexec && (is_gui || !is_terminal) {
+        std::process::Command::new("pkexec")
+            .arg(&exe)
+            .args(&child_args)
+            .status()
+    } else {
+        std::process::Command::new("sudo")
+            .arg("-E")
+            .arg(&exe)
+            .args(&child_args)
+            .status()
+            .or_else(|_| {
+                std::process::Command::new("sudo")
+                    .arg(&exe)
+                    .args(&child_args)
+                    .status()
+            })
+    };
+
+    match status {
+        Ok(s) => {
+            std::process::exit(s.code().unwrap_or(1));
+        }
+        Err(e) => {
+            eprintln!("[!] Elevation failed: {}", e);
+            false
+        }
+    }
+}
+
+#[cfg(windows)]
+pub fn ensure_elevated(_is_gui: bool) -> bool {
+    handle_elevation_args();
+    is_admin()
+}
+
 pub fn ensure_automount_enabled() -> Result<(), String> {
     #[cfg(windows)]
     {

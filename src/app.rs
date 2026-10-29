@@ -57,6 +57,22 @@ pub enum Screen {
     AddImageName,
     RenameImage,
     Help,
+    FilePicker,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FilePickerMode {
+    AddImage,
+    OpenOnce,
+    ImportFolder,
+}
+
+#[derive(Debug, Clone)]
+pub struct FilePickerItem {
+    pub name: String,
+    pub path: PathBuf,
+    pub is_dir: bool,
+    pub size: u64,
 }
 
 pub struct HashJob {
@@ -102,11 +118,20 @@ pub struct AppState {
 
     pub lang: Lang,
 
+    pub file_picker_mode: FilePickerMode,
+    pub file_picker_dir: PathBuf,
+    pub file_picker_entries: Vec<FilePickerItem>,
+    pub file_picker_selected: usize,
+
     pub log: Vec<String>,
 }
 
 impl Default for AppState {
     fn default() -> Self {
+        let initial_dir = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+
         Self {
             image_path: None,
             image_size: 0,
@@ -141,6 +166,11 @@ impl Default for AppState {
             write_started_at: None,
 
             lang: Lang::default(),
+
+            file_picker_mode: FilePickerMode::AddImage,
+            file_picker_dir: initial_dir,
+            file_picker_entries: Vec::new(),
+            file_picker_selected: 0,
 
             log: Vec::new(),
         }
@@ -725,16 +755,121 @@ impl AppState {
         }
     }
 
-    pub fn open_add_file_dialog(&mut self) {
-        let Some(path) = rfd::FileDialog::new()
-            .set_title("Select image")
-            .add_filter("Images", &["img", "iso", "raw"])
-            .add_filter("All files", &["*"])
-            .pick_file()
-        else {
-            return;
-        };
+    pub fn refresh_file_picker_entries(&mut self) {
+        let mut entries = Vec::new();
+        if let Some(parent) = self.file_picker_dir.parent() {
+            entries.push(FilePickerItem {
+                name: "..".to_string(),
+                path: parent.to_path_buf(),
+                is_dir: true,
+                size: 0,
+            });
+        }
 
+        if let Ok(rd) = std::fs::read_dir(&self.file_picker_dir) {
+            let mut items = Vec::new();
+            for entry in rd.flatten() {
+                let path = entry.path();
+                let file_name = entry.file_name().to_string_lossy().to_string();
+                if file_name.starts_with('.') {
+                    continue;
+                }
+                let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
+                let size = if is_dir {
+                    0
+                } else {
+                    entry.metadata().map(|m| m.len()).unwrap_or(0)
+                };
+
+                if !is_dir && self.file_picker_mode != FilePickerMode::ImportFolder {
+                    let ext = path
+                        .extension()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or("")
+                        .to_lowercase();
+                    if !["img", "iso", "raw", "bin"].contains(&ext.as_str()) {
+                        continue;
+                    }
+                }
+
+                items.push(FilePickerItem {
+                    name: file_name,
+                    path,
+                    is_dir,
+                    size,
+                });
+            }
+
+            items.sort_by(|a, b| match (a.is_dir, b.is_dir) {
+                (true, false) => std::cmp::Ordering::Less,
+                (false, true) => std::cmp::Ordering::Greater,
+                _ => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
+            });
+
+            entries.extend(items);
+        }
+
+        self.file_picker_entries = entries;
+        if self.file_picker_selected >= self.file_picker_entries.len() {
+            self.file_picker_selected = 0;
+        }
+    }
+
+    pub fn open_builtin_file_picker(&mut self, mode: FilePickerMode) {
+        self.file_picker_mode = mode;
+        self.refresh_file_picker_entries();
+        self.screen = Screen::FilePicker;
+    }
+
+    pub fn select_image_path(&mut self, path: PathBuf, save_to_catalog: bool) {
+        if !path.exists() {
+            self.push_log(format!("[!] File not found: {}", path.display()));
+            return;
+        }
+
+        let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+        self.image_path = Some(path.clone());
+        self.image_size = size;
+
+        let work_name = self
+            .find_catalog_entry_by_path(&path)
+            .map(|e| e.work_name.clone())
+            .unwrap_or_else(|| {
+                path.file_stem()
+                    .map(|s| s.to_string_lossy().to_string())
+                    .unwrap_or_else(|| "image".to_string())
+            });
+
+        self.image_work_name = Some(work_name.clone());
+
+        if let Some(entry) = self.find_catalog_entry_by_path(&path).cloned() {
+            self.image_sha256 = Some(entry.sha256);
+            self.image_hash_progress = None;
+            self.hash_job = None;
+            self.push_log(format!(
+                "Loaded from catalog: {} ({:.2} GB, SHA-256 ready)",
+                entry.work_name,
+                size as f64 / 1e9
+            ));
+            self.screen = Screen::Main;
+            return;
+        }
+
+        self.image_sha256 = None;
+        self.image_hash_progress = None;
+        self.push_log(format!(
+            "Selected image: {} ({:.2} GB), computing SHA-256…",
+            path.display(),
+            size as f64 / 1e9
+        ));
+        self.hash_job = Some(HashJob {
+            rx: compute_sha256_async(path.display().to_string()),
+            save_to_catalog,
+        });
+        self.screen = Screen::Main;
+    }
+
+    pub fn apply_add_image_path(&mut self, path: PathBuf) {
         let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
         let default_name = self
             .find_catalog_entry_by_path(&path)
@@ -756,16 +891,7 @@ impl AppState {
         ));
     }
 
-    pub fn open_ephemeral_file_dialog(&mut self) {
-        let Some(path) = rfd::FileDialog::new()
-            .set_title("Open image once (without saving to catalog)")
-            .add_filter("Images", &["img", "iso", "raw"])
-            .add_filter("All files", &["*"])
-            .pick_file()
-        else {
-            return;
-        };
-
+    pub fn apply_ephemeral_image_path(&mut self, path: PathBuf) {
         let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
         let name = path
             .file_stem()
@@ -791,19 +917,38 @@ impl AppState {
         self.screen = Screen::Main;
     }
 
+    pub fn apply_import_folder(&mut self, folder: PathBuf) {
+        self.push_log(format!("[import] folder: {}", folder.display()));
+        self.import_job = Some(spawn_folder_import(folder));
+        self.screen = Screen::Main;
+    }
+
+    pub fn open_add_file_dialog(&mut self) {
+        if let Some(path) = crate::picker::pick_image_file() {
+            self.apply_add_image_path(path);
+        } else {
+            self.open_builtin_file_picker(FilePickerMode::AddImage);
+        }
+    }
+
+    pub fn open_ephemeral_file_dialog(&mut self) {
+        if let Some(path) = crate::picker::pick_image_file() {
+            self.apply_ephemeral_image_path(path);
+        } else {
+            self.open_builtin_file_picker(FilePickerMode::OpenOnce);
+        }
+    }
+
     pub fn open_import_folder_dialog(&mut self) {
         if self.import_job.is_some() {
             self.push_log("[!] Import already in progress");
             return;
         }
-        let Some(folder) = rfd::FileDialog::new()
-            .set_title("Select folder with images")
-            .pick_folder()
-        else {
-            return;
-        };
-        self.push_log(format!("[import] folder: {}", folder.display()));
-        self.import_job = Some(spawn_folder_import(folder));
+        if let Some(folder) = crate::picker::pick_image_folder() {
+            self.apply_import_folder(folder);
+        } else {
+            self.open_builtin_file_picker(FilePickerMode::ImportFolder);
+        }
     }
 
     pub fn delete_selected_from_catalog(&mut self) {

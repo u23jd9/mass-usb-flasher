@@ -37,6 +37,7 @@ pub fn render(f: &mut Frame, state: &AppState) {
             render_input_modal(f, state, state.t().title_rename, state.t().prompt_new_name);
         }
         Screen::Help => render_help(f, state),
+        Screen::FilePicker => render_file_picker(f, state),
     }
 }
 
@@ -689,4 +690,82 @@ fn format_elapsed(secs: f64) -> String {
     } else {
         format!("{}h {:02}m {:02}s", s / 3600, (s % 3600) / 60, s % 60)
     }
+}
+
+fn render_file_picker(f: &mut Frame, state: &AppState) {
+    let area = centered_rect(80, 80, f.area());
+    f.render_widget(Clear, area);
+
+    let t = state.t();
+    let title = match state.file_picker_mode {
+        crate::app::FilePickerMode::AddImage => format!(" {} [Add] ", t.gui_btn_select),
+        crate::app::FilePickerMode::OpenOnce => format!(" {} [Open] ", t.gui_btn_open_once),
+        crate::app::FilePickerMode::ImportFolder => format!(" {} [Folder] ", t.cat_hint_f),
+    };
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3),
+            Constraint::Min(5),
+            Constraint::Length(3),
+        ])
+        .split(area);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(bold(cyan()))
+        .title(title);
+    f.render_widget(block, area);
+
+    let path_str = state.file_picker_dir.display().to_string();
+    let path_p = Paragraph::new(Line::from(vec![
+        Span::styled(" Directory: ", bold(yellow())),
+        Span::styled(truncate(&path_str, 70), gray()),
+    ])).block(Block::default().borders(Borders::BOTTOM));
+    f.render_widget(path_p, chunks[0]);
+
+    let rows: Vec<Row> = state.file_picker_entries.iter().enumerate().map(|(idx, item)| {
+        let is_sel = idx == state.file_picker_selected;
+        let prefix = if item.is_dir { "📁 " } else { "📄 " };
+        let name_style = if is_sel {
+            bold(green())
+        } else if item.is_dir {
+            bold(cyan())
+        } else {
+            gray()
+        };
+
+        let size_str = if item.is_dir {
+            "—".to_string()
+        } else {
+            format!("{:.2} GB", item.size as f64 / 1e9)
+        };
+
+        let cells = vec![
+            Cell::from(format!("{}{}", prefix, item.name)).style(name_style),
+            Cell::from(size_str).style(dim()),
+        ];
+
+        let mut row = Row::new(cells);
+        if is_sel {
+            row = row.style(Style::default().bg(Color::Rgb(40, 50, 70)));
+        }
+        row
+    }).collect();
+
+    let widths = [Constraint::Min(30), Constraint::Length(14)];
+    let table = Table::new(rows, widths)
+        .block(Block::default().borders(Borders::NONE));
+    f.render_widget(table, chunks[1]);
+
+    let hint = if state.file_picker_mode == crate::app::FilePickerMode::ImportFolder {
+        "[Enter/Space] Select Folder  ·  [↑/↓] Navigate  ·  [Backspace] Up  ·  [Esc] Cancel"
+    } else {
+        "[Enter] Select File / Enter Dir  ·  [↑/↓] Navigate  ·  [Backspace] Up  ·  [Esc] Cancel"
+    };
+    let footer_p = Paragraph::new(Line::from(vec![
+        Span::styled(hint, dim()),
+    ])).block(Block::default().borders(Borders::TOP));
+    f.render_widget(footer_p, chunks[2]);
 }

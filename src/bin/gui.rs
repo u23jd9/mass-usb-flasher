@@ -8,23 +8,78 @@ use eframe::egui::{self, Align, Color32, Layout, RichText, Rounding, Stroke, Vec
 use mass_usb_flasher::app::{AppState, AppStatus, SlotStatus};
 use mass_usb_flasher::catalog::Catalog;
 use mass_usb_flasher::common::{
-    compute_window_title, ensure_automount_enabled, format_elapsed, is_admin, parse_args,
-    parse_target_count_arg,
+    compute_window_title, ensure_automount_enabled, ensure_elevated, format_elapsed,
+    parse_args, parse_target_count_arg,
 };
 use mass_usb_flasher::device::watcher::{DeviceFilter, WatcherConfig, WatcherHandle};
 use mass_usb_flasher::i18n::{VERSION, WATERMARK, WATERMARK_URL};
 use mass_usb_flasher::taskbar::Taskbar;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GuiTheme {
+    Dark,
+    Light,
+}
+
+struct ThemeColors {
+    top_panel_bg: Color32,
+    bottom_panel_bg: Color32,
+    card_bg: Color32,
+    card_stroke: Color32,
+    text_primary: Color32,
+    text_muted: Color32,
+    empty_box_bg: Color32,
+    empty_icon_color: Color32,
+}
+
+impl GuiTheme {
+    pub fn visuals(self) -> egui::Visuals {
+        match self {
+            GuiTheme::Dark => {
+                let mut v = egui::Visuals::dark();
+                v.window_rounding = Rounding::same(8.0);
+                v.panel_fill = Color32::from_rgb(22, 23, 28);
+                v.window_fill = Color32::from_rgb(28, 30, 36);
+                v
+            }
+            GuiTheme::Light => {
+                let mut v = egui::Visuals::light();
+                v.window_rounding = Rounding::same(8.0);
+                v.panel_fill = Color32::from_rgb(246, 248, 252);
+                v.window_fill = Color32::from_rgb(255, 255, 255);
+                v
+            }
+        }
+    }
+
+    fn colors(self) -> ThemeColors {
+        match self {
+            GuiTheme::Dark => ThemeColors {
+                top_panel_bg: Color32::from_rgb(28, 30, 36),
+                bottom_panel_bg: Color32::from_rgb(20, 21, 26),
+                card_bg: Color32::from_rgb(34, 36, 44),
+                card_stroke: Color32::from_rgb(52, 56, 68),
+                text_primary: Color32::from_rgb(235, 238, 245),
+                text_muted: Color32::from_rgb(145, 150, 165),
+                empty_box_bg: Color32::from_rgb(28, 29, 36),
+                empty_icon_color: Color32::from_rgb(120, 120, 140),
+            },
+            GuiTheme::Light => ThemeColors {
+                top_panel_bg: Color32::from_rgb(238, 241, 248),
+                bottom_panel_bg: Color32::from_rgb(230, 234, 242),
+                card_bg: Color32::from_rgb(255, 255, 255),
+                card_stroke: Color32::from_rgb(215, 220, 230),
+                text_primary: Color32::from_rgb(25, 28, 36),
+                text_muted: Color32::from_rgb(105, 112, 128),
+                empty_box_bg: Color32::from_rgb(240, 242, 248),
+                empty_icon_color: Color32::from_rgb(160, 165, 185),
+            },
+        }
+    }
+}
+
 fn main() -> eframe::Result<()> {
-    if !is_admin() {
-        rfd::MessageDialog::new()
-            .set_level(rfd::MessageLevel::Error)
-            .set_title("Administrator Rights Required")
-            .set_description(
-                "Mass USB Flasher requires administrator rights to access physical disk drives.\n\
-                 Please right-click and 'Run as administrator'.",
-            )
-            .show();
+    if !ensure_elevated(true) {
         std::process::exit(1);
     }
 
@@ -49,8 +104,10 @@ struct MufGuiApp {
     state: AppState,
     watcher: WatcherHandle,
     taskbar: Taskbar,
+    theme: GuiTheme,
     show_catalog_modal: bool,
     show_help_modal: bool,
+    show_file_picker_modal: bool,
     show_log_panel: bool,
     last_taskbar_update: Instant,
     last_taskbar_pct: i32,
@@ -58,11 +115,8 @@ struct MufGuiApp {
 
 impl MufGuiApp {
     fn new(cc: &eframe::CreationContext) -> Self {
-        let mut visuals = egui::Visuals::dark();
-        visuals.window_rounding = Rounding::same(8.0);
-        visuals.panel_fill = Color32::from_rgb(26, 27, 32);
-        visuals.override_text_color = Some(Color32::from_rgb(230, 230, 235));
-        cc.egui_ctx.set_visuals(visuals);
+        let theme = GuiTheme::Dark;
+        cc.egui_ctx.set_visuals(theme.visuals());
 
         let mut state = AppState::new();
 
@@ -95,8 +149,10 @@ impl MufGuiApp {
             state,
             watcher,
             taskbar: Taskbar::new(),
+            theme,
             show_catalog_modal: false,
             show_help_modal: false,
+            show_file_picker_modal: false,
             show_log_panel: false,
             last_taskbar_update: Instant::now(),
             last_taskbar_pct: -1,
@@ -148,11 +204,25 @@ impl eframe::App for MufGuiApp {
             ctx.request_repaint_after(Duration::from_millis(100));
         }
 
+        let colors = self.theme.colors();
+
+        // Handle drag-and-drop of disk images
+        ctx.input(|i| {
+            if !i.raw.dropped_files.is_empty() {
+                for file in &i.raw.dropped_files {
+                    if let Some(path) = &file.path {
+                        self.state.select_image_path(path.clone(), true);
+                        break;
+                    }
+                }
+            }
+        });
+
         // --- ВЕРХНЯЯ ПАНЕЛЬ (Header & Image Controls) ---
         egui::TopBottomPanel::top("top_panel")
             .frame(
                 egui::Frame::none()
-                    .fill(Color32::from_rgb(32, 33, 40))
+                    .fill(colors.top_panel_bg)
                     .inner_margin(12.0),
             )
             .show(ctx, |ui| {
@@ -165,7 +235,7 @@ impl eframe::App for MufGuiApp {
         egui::TopBottomPanel::bottom("bottom_panel")
             .frame(
                 egui::Frame::none()
-                    .fill(Color32::from_rgb(22, 23, 28))
+                    .fill(colors.bottom_panel_bg)
                     .inner_margin(12.0),
             )
             .show(ctx, |ui| {
@@ -189,6 +259,10 @@ impl eframe::App for MufGuiApp {
 
         if self.show_help_modal {
             self.render_help_window(ctx);
+        }
+
+        if self.show_file_picker_modal {
+            self.render_file_picker_window(ctx);
         }
     }
 }
@@ -231,21 +305,13 @@ impl MufGuiApp {
                 ),
             };
 
-            ui.painter().rect_filled(
-                ui.available_rect_before_wrap(),
-                Rounding::same(4.0),
-                bg_color,
-            );
-
-            ui.add(
-                egui::Button::new(
-                    RichText::new(format!("  {}  ", status_text))
-                        .strong()
-                        .color(fg_color),
-                )
+            egui::Frame::none()
                 .fill(bg_color)
-                .stroke(Stroke::NONE),
-            );
+                .rounding(Rounding::same(4.0))
+                .inner_margin(egui::Margin::symmetric(10.0, 4.0))
+                .show(ui, |ui| {
+                    ui.label(RichText::new(status_text).strong().color(fg_color));
+                });
 
             // Управление целевым количеством
             ui.add_space(20.0);
@@ -263,16 +329,28 @@ impl MufGuiApp {
                 self.state.increase_target();
             }
 
-            // Переключатель языка
+            // Переключатели темы и языка
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 if ui
                     .button(
                         RichText::new(format!("🌐 {}", self.state.lang.code()))
-                            .color(Color32::from_rgb(150, 200, 255)),
+                            .color(Color32::from_rgb(100, 180, 255)),
                     )
                     .clicked()
                 {
                     self.state.lang = self.state.lang.toggle();
+                }
+
+                let theme_text = match self.theme {
+                    GuiTheme::Dark => t.gui_theme_dark,
+                    GuiTheme::Light => t.gui_theme_light,
+                };
+                if ui.button(RichText::new(theme_text)).clicked() {
+                    self.theme = match self.theme {
+                        GuiTheme::Dark => GuiTheme::Light,
+                        GuiTheme::Light => GuiTheme::Dark,
+                    };
+                    ui.ctx().set_visuals(self.theme.visuals());
                 }
             });
         });
@@ -280,9 +358,10 @@ impl MufGuiApp {
 
     fn render_image_card(&mut self, ui: &mut egui::Ui) {
         let t = self.state.t();
+        let colors = self.theme.colors();
         egui::Frame::none()
-            .fill(Color32::from_rgb(38, 40, 48))
-            .stroke(Stroke::new(1.0_f32, Color32::from_rgb(55, 58, 68)))
+            .fill(colors.card_bg)
+            .stroke(Stroke::new(1.0_f32, colors.card_stroke))
             .rounding(Rounding::same(6.0))
             .inner_margin(10.0)
             .show(ui, |ui| {
@@ -302,8 +381,7 @@ impl MufGuiApp {
                         );
                         ui.label(
                             RichText::new(path.file_name().unwrap_or_default().to_string_lossy())
-                                .strong()
-                                .color(Color32::WHITE),
+                                .strong(),
                         )
                         .on_hover_text(path.display().to_string());
 
@@ -322,7 +400,13 @@ impl MufGuiApp {
 
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         if ui.button(t.gui_btn_open_once).clicked() {
-                            self.state.open_ephemeral_file_dialog();
+                            if let Some(path) = mass_usb_flasher::picker::pick_image_file() {
+                                self.state.select_image_path(path, false);
+                            } else {
+                                self.state.file_picker_mode = mass_usb_flasher::app::FilePickerMode::OpenOnce;
+                                self.state.refresh_file_picker_entries();
+                                self.show_file_picker_modal = true;
+                            }
                         }
                         if ui.button(t.gui_btn_catalog).clicked() {
                             self.show_catalog_modal = true;
@@ -331,7 +415,13 @@ impl MufGuiApp {
                             .button(RichText::new(t.gui_btn_select).strong())
                             .clicked()
                         {
-                            self.state.open_add_file_dialog();
+                            if let Some(path) = mass_usb_flasher::picker::pick_image_file() {
+                                self.state.select_image_path(path, true);
+                            } else {
+                                self.state.file_picker_mode = mass_usb_flasher::app::FilePickerMode::AddImage;
+                                self.state.refresh_file_picker_entries();
+                                self.show_file_picker_modal = true;
+                            }
                         }
                     });
                 });
@@ -374,6 +464,7 @@ impl MufGuiApp {
 
     fn render_devices_table(&mut self, ui: &mut egui::Ui) {
         let t = self.state.t();
+        let colors = self.theme.colors();
         let ready_count = self.state.ready_count();
         let target = self.state.target_count;
         let total_count = self.state.devices.len();
@@ -393,7 +484,8 @@ impl MufGuiApp {
 
         if self.state.devices.is_empty() {
             egui::Frame::none()
-                .fill(Color32::from_rgb(30, 31, 38))
+                .fill(colors.empty_box_bg)
+                .stroke(Stroke::new(1.0_f32, colors.card_stroke))
                 .rounding(Rounding::same(6.0))
                 .inner_margin(40.0)
                 .show(ui, |ui| {
@@ -401,7 +493,7 @@ impl MufGuiApp {
                         ui.label(
                             RichText::new("🔌")
                                 .size(36.0)
-                                .color(Color32::from_rgb(120, 120, 140)),
+                                .color(colors.empty_icon_color),
                         );
                         ui.add_space(8.0);
                         ui.label(RichText::new(t.gui_no_devices).size(15.0).weak());
@@ -605,10 +697,22 @@ impl MufGuiApp {
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
                     if ui.button(t.cat_hint_a).clicked() {
-                        self.state.open_add_file_dialog();
+                        if let Some(path) = mass_usb_flasher::picker::pick_image_file() {
+                            self.state.select_image_path(path, true);
+                        } else {
+                            self.state.file_picker_mode = mass_usb_flasher::app::FilePickerMode::AddImage;
+                            self.state.refresh_file_picker_entries();
+                            self.show_file_picker_modal = true;
+                        }
                     }
                     if ui.button(t.cat_hint_f).clicked() {
-                        self.state.open_import_folder_dialog();
+                        if let Some(folder) = mass_usb_flasher::picker::pick_image_folder() {
+                            self.state.apply_import_folder(folder);
+                        } else {
+                            self.state.file_picker_mode = mass_usb_flasher::app::FilePickerMode::ImportFolder;
+                            self.state.refresh_file_picker_entries();
+                            self.show_file_picker_modal = true;
+                        }
                     }
                 });
                 ui.separator();
@@ -702,6 +806,81 @@ impl MufGuiApp {
 
         if !open {
             self.show_help_modal = false;
+        }
+    }
+
+    fn render_file_picker_window(&mut self, ctx: &egui::Context) {
+        let t = self.state.t();
+        let mut open = true;
+
+        egui::Window::new(format!("📁 {}", t.gui_file_picker_title))
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(true)
+            .default_size([720.0, 480.0])
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    if ui.button(t.gui_up_dir).clicked() {
+                        if let Some(parent) = self.state.file_picker_dir.parent().map(|p| p.to_path_buf()) {
+                            self.state.file_picker_dir = parent;
+                            self.state.refresh_file_picker_entries();
+                        }
+                    }
+
+                    ui.label(RichText::new(self.state.file_picker_dir.display().to_string()).strong().monospace());
+
+                    if self.state.file_picker_mode == mass_usb_flasher::app::FilePickerMode::ImportFolder {
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            if ui.button(RichText::new(t.gui_btn_select_dir).strong()).clicked() {
+                                let dir = self.state.file_picker_dir.clone();
+                                self.state.apply_import_folder(dir);
+                                self.show_file_picker_modal = false;
+                            }
+                        });
+                    }
+                });
+
+                ui.separator();
+
+                egui::ScrollArea::vertical().max_height(340.0).show(ui, |ui| {
+                    let mut chosen_entry = None;
+                    for item in &self.state.file_picker_entries {
+                        let prefix = if item.is_dir { "📁 " } else { "📄 " };
+                        let label_text = if item.is_dir {
+                            format!("{}{}", prefix, item.name)
+                        } else {
+                            format!("{}{} ({:.2} GB)", prefix, item.name, item.size as f64 / 1e9)
+                        };
+
+                        if ui.selectable_label(false, label_text).clicked() {
+                            chosen_entry = Some(item.clone());
+                        }
+                    }
+
+                    if let Some(item) = chosen_entry {
+                        if item.is_dir {
+                            self.state.file_picker_dir = item.path;
+                            self.state.refresh_file_picker_entries();
+                        } else {
+                            match self.state.file_picker_mode {
+                                mass_usb_flasher::app::FilePickerMode::AddImage => {
+                                    self.state.select_image_path(item.path, true);
+                                    self.show_file_picker_modal = false;
+                                }
+                                mass_usb_flasher::app::FilePickerMode::OpenOnce => {
+                                    self.state.select_image_path(item.path, false);
+                                    self.show_file_picker_modal = false;
+                                }
+                                mass_usb_flasher::app::FilePickerMode::ImportFolder => {}
+                            }
+                        }
+                    }
+                });
+            });
+
+        if !open {
+            self.show_file_picker_modal = false;
         }
     }
 }

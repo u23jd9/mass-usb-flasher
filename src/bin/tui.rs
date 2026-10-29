@@ -18,8 +18,8 @@ use ratatui::{
 use mass_usb_flasher::app::{AppState, AppStatus, Screen};
 use mass_usb_flasher::catalog::Catalog;
 use mass_usb_flasher::common::{
-    compute_window_title, ensure_automount_enabled, is_admin, normalize_key, parse_args,
-    parse_target_count_arg,
+    compute_window_title, ensure_automount_enabled, ensure_elevated, normalize_key,
+    parse_args, parse_target_count_arg,
 };
 use mass_usb_flasher::device::watcher::{DeviceFilter, WatcherConfig};
 use mass_usb_flasher::i18n::{VERSION, WATERMARK, WATERMARK_URL};
@@ -29,7 +29,7 @@ use mass_usb_flasher::ui;
 fn main() -> io::Result<()> {
     install_panic_hook();
 
-    if !is_admin() {
+    if !ensure_elevated(false) {
         eprintln!("[!] Administrator rights required. Run as administrator.");
         std::process::exit(1);
     }
@@ -204,6 +204,7 @@ fn handle_key(state: &mut AppState, key: KeyEvent) -> bool {
         Screen::AddImageName => handle_key_add_name(state, key),
         Screen::RenameImage => handle_key_rename(state, key),
         Screen::Help => handle_key_help(state, key),
+        Screen::FilePicker => handle_key_file_picker(state, key),
     }
 }
 
@@ -289,12 +290,80 @@ fn handle_key_image_select(state: &mut AppState, key: KeyEvent) -> bool {
         }
         KeyCode::Char(c) => match normalize_key(c) {
             'a' => state.open_add_file_dialog(),
+            'b' => state.open_builtin_file_picker(mass_usb_flasher::app::FilePickerMode::AddImage),
             'o' => state.open_ephemeral_file_dialog(),
             'd' => state.delete_selected_from_catalog(),
             'r' => state.start_rename_selected(),
             'f' => state.open_import_folder_dialog(),
             _ => {}
         },
+        _ => {}
+    }
+    false
+}
+
+fn handle_key_file_picker(state: &mut AppState, key: KeyEvent) -> bool {
+    match key.code {
+        KeyCode::Up => {
+            if state.file_picker_selected > 0 {
+                state.file_picker_selected -= 1;
+            }
+        }
+        KeyCode::Down => {
+            if !state.file_picker_entries.is_empty()
+                && state.file_picker_selected + 1 < state.file_picker_entries.len()
+            {
+                state.file_picker_selected += 1;
+            }
+        }
+        KeyCode::PageUp => {
+            state.file_picker_selected = state.file_picker_selected.saturating_sub(10);
+        }
+        KeyCode::PageDown => {
+            if !state.file_picker_entries.is_empty() {
+                state.file_picker_selected = (state.file_picker_selected + 10)
+                    .min(state.file_picker_entries.len().saturating_sub(1));
+            }
+        }
+        KeyCode::Backspace => {
+            if let Some(parent) = state.file_picker_dir.parent().map(|p| p.to_path_buf()) {
+                state.file_picker_dir = parent;
+                state.file_picker_selected = 0;
+                state.refresh_file_picker_entries();
+            }
+        }
+        KeyCode::Enter => {
+            if let Some(item) = state
+                .file_picker_entries
+                .get(state.file_picker_selected)
+                .cloned()
+            {
+                if item.is_dir {
+                    state.file_picker_dir = item.path;
+                    state.file_picker_selected = 0;
+                    state.refresh_file_picker_entries();
+                } else {
+                    match state.file_picker_mode {
+                        mass_usb_flasher::app::FilePickerMode::AddImage => {
+                            state.apply_add_image_path(item.path);
+                        }
+                        mass_usb_flasher::app::FilePickerMode::OpenOnce => {
+                            state.apply_ephemeral_image_path(item.path);
+                        }
+                        mass_usb_flasher::app::FilePickerMode::ImportFolder => {}
+                    }
+                }
+            }
+        }
+        KeyCode::Char(' ')
+            if state.file_picker_mode == mass_usb_flasher::app::FilePickerMode::ImportFolder =>
+        {
+            let dir = state.file_picker_dir.clone();
+            state.apply_import_folder(dir);
+        }
+        KeyCode::Esc => {
+            state.screen = Screen::ImageSelect;
+        }
         _ => {}
     }
     false

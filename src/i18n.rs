@@ -151,6 +151,11 @@ i18n! {
     gui_no_devices = "No USB devices detected. Insert USB drives to start." / "USB-накопители не обнаружены. Вставьте флешки для записи.",
     gui_waiting_devices = "Waiting for required number of drives" / "Ожидание достаточного количества устройств",
     gui_all_done = "🎉 All target flash drives written successfully!" / "🎉 Все целевые флешки успешно записаны!",
+    gui_theme_dark = "🌙 Dark" / "🌙 Тёмная",
+    gui_theme_light = "☀️ Light" / "☀️ Светлая",
+    gui_file_picker_title = "Browse Files" / "Обзор файлов",
+    gui_btn_select_dir = "✔ Select This Folder" / "✔ Выбрать эту папку",
+    gui_up_dir = "⬆ Up" / "⬆ Вверх",
 }
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
