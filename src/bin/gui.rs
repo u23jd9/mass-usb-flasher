@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 use eframe::egui::{self, Align, Align2, Color32, Layout, RichText, Rounding, Stroke, Vec2};
 
 use mass_usb_flasher::app::{AppState, AppStatus, SlotStatus};
-use mass_usb_flasher::benchmark::{BenchmarkPhase, BenchmarkTestSize};
+use mass_usb_flasher::benchmark::{BenchmarkMode, BenchmarkPhase, BenchmarkTestSize};
 use mass_usb_flasher::catalog::Catalog;
 use mass_usb_flasher::common::{
     compute_window_title, ensure_automount_enabled, ensure_elevated, format_elapsed,
@@ -711,53 +711,40 @@ impl MufGuiApp {
                     });
 
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        // Главная кнопка запуска / остановки бенчмарка
-                        if self.state.benchmark_active {
-                            let stop_btn = egui::Button::new(
-                                RichText::new(t.bench_btn_stop)
-                                    .size(14.0)
-                                    .strong()
-                                    .color(Color32::WHITE),
-                            )
-                            .fill(Color32::from_rgb(211, 47, 47))
-                            .min_size(Vec2::new(170.0, 34.0));
-
-                            if ui.add(stop_btn).clicked() {
-                                self.state.stop_benchmark();
-                            }
-                        } else {
-                            let can_start = !self.state.devices.is_empty()
-                                && self.state.status != AppStatus::Running;
-                            let start_btn = egui::Button::new(
-                                RichText::new(t.bench_btn_run_all)
-                                    .size(14.0)
-                                    .strong()
-                                    .color(if can_start { Color32::WHITE } else { Color32::from_rgb(140, 140, 140) }),
-                            )
-                            .fill(if can_start { Color32::from_rgb(46, 125, 50) } else { Color32::from_rgb(45, 50, 45) })
-                            .min_size(Vec2::new(180.0, 34.0));
-
-                            if ui
-                                .add_enabled(can_start, start_btn)
-                                .on_hover_text("Wipes partition table on all ready drives and runs full write + read speed & stability benchmark")
-                                .clicked()
-                            {
-                                self.state.start_benchmark_all();
-                            }
-                        }
-
-                        ui.add_space(14.0);
-
                         // Чекбокс затирания таблицы разделов
                         ui.checkbox(
                             &mut self.state.benchmark_config.wipe_partitions,
                             RichText::new(t.bench_wipe_partitions).strong().size(12.0),
                         ).on_hover_text("Crucial: writes zeroes to sector 0 (MBR/GPT) and backup GPT at the end of the disk so OS releases volume locks");
 
-                        ui.add_space(10.0);
+                        ui.add_space(14.0);
+
+                        // Выбор режима (Обычный / Детальный с термодиагностикой перегрева)
+                        let lang = self.state.lang;
+                        let mode_label = match lang {
+                            mass_usb_flasher::i18n::Lang::Ru => self.state.benchmark_config.mode.label_ru(),
+                            mass_usb_flasher::i18n::Lang::En => self.state.benchmark_config.mode.label_en(),
+                        };
+
+                        egui::ComboBox::from_id_salt("bench_mode_combo")
+                            .selected_text(RichText::new(mode_label).strong().color(Color32::from_rgb(100, 200, 255)))
+                            .show_ui(ui, |ui| {
+                                for &m in &[BenchmarkMode::Detailed, BenchmarkMode::Standard] {
+                                    let l = match lang {
+                                        mass_usb_flasher::i18n::Lang::Ru => m.label_ru(),
+                                        mass_usb_flasher::i18n::Lang::En => m.label_en(),
+                                    };
+                                    ui.selectable_value(&mut self.state.benchmark_config.mode, m, l);
+                                }
+                            })
+                            .response
+                            .on_hover_text("Detailed mode monitors controller thermal disconnections, gives 3s cool-down pauses and auto-recovers to diagnose overheating vs hardware failure");
+
+                        ui.label(RichText::new(t.bench_lbl_mode).strong());
+
+                        ui.add_space(14.0);
 
                         // Выбор объёма теста
-                        let lang = self.state.lang;
                         let current_size_label = match lang {
                             mass_usb_flasher::i18n::Lang::Ru => self.state.benchmark_config.test_size.label_ru(),
                             mass_usb_flasher::i18n::Lang::En => self.state.benchmark_config.test_size.label_en(),
@@ -1340,6 +1327,13 @@ impl MufGuiApp {
                                     }
                                     if res.partitions_wiped {
                                         ui.label(RichText::new("MBR/GPT wiped ✔").weak().size(10.0));
+                                    }
+                                    if res.controller_disconnects > 0 {
+                                        let disc_msg = match self.state.lang {
+                                            mass_usb_flasher::i18n::Lang::Ru => format!("⚠️ {} сбоев перегрева (восстановлен)", res.controller_disconnects),
+                                            mass_usb_flasher::i18n::Lang::En => format!("⚠️ {} thermal reset(s) (recovered)", res.controller_disconnects),
+                                        };
+                                        ui.label(RichText::new(disc_msg).color(Color32::from_rgb(255, 179, 0)).size(10.0));
                                     }
                                 } else {
                                     ui.label(RichText::new("—").weak());

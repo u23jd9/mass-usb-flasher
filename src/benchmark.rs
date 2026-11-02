@@ -52,9 +52,38 @@ impl BenchmarkTestSize {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BenchmarkMode {
+    Standard,
+    Detailed,
+}
+
+impl Default for BenchmarkMode {
+    fn default() -> Self {
+        BenchmarkMode::Detailed
+    }
+}
+
+impl BenchmarkMode {
+    pub fn label_en(&self) -> &'static str {
+        match self {
+            BenchmarkMode::Standard => "Standard (Continuous)",
+            BenchmarkMode::Detailed => "Detailed (Thermal Stress & Recovery)",
+        }
+    }
+
+    pub fn label_ru(&self) -> &'static str {
+        match self {
+            BenchmarkMode::Standard => "Обычный (Сплошной)",
+            BenchmarkMode::Detailed => "Детальный (Стресс и перегрев)",
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct BenchmarkConfig {
     pub test_size: BenchmarkTestSize,
+    pub mode: BenchmarkMode,
     pub wipe_partitions: bool,
 }
 
@@ -62,6 +91,7 @@ impl Default for BenchmarkConfig {
     fn default() -> Self {
         Self {
             test_size: BenchmarkTestSize::Size1GB,
+            mode: BenchmarkMode::Detailed,
             wipe_partitions: true,
         }
     }
@@ -87,12 +117,22 @@ pub struct StabilityMetrics {
     pub std_dev_mbps: f64,
     pub stability_pct: f64, // 0.0 - 100.0%
     pub drop_ratio_pct: f64, // min / avg * 100.0%
+    pub controller_disconnects: u32,
+    pub thermal_throttled: bool,
 }
 
 impl StabilityMetrics {
-    pub fn compute(samples: &[f32], total_bytes: u64, total_duration: Duration) -> Self {
+    pub fn compute(
+        samples: &[f32],
+        total_bytes: u64,
+        total_duration: Duration,
+        disconnects: u32,
+    ) -> Self {
         if samples.is_empty() || total_duration.is_zero() {
-            return Self::default();
+            return Self {
+                controller_disconnects: disconnects,
+                ..Default::default()
+            };
         }
 
         let total_secs = total_duration.as_secs_f64();
@@ -145,6 +185,10 @@ impl StabilityMetrics {
             0.0
         };
 
+        let thermal_throttled = min_mbps > 0.0
+            && (min_mbps < avg_mbps * 0.35 || drop_ratio_pct < 35.0)
+            && max_mbps > avg_mbps * 1.3;
+
         Self {
             avg_mbps,
             min_mbps: if min_mbps == f64::MAX { 0.0 } else { min_mbps },
@@ -152,30 +196,40 @@ impl StabilityMetrics {
             std_dev_mbps: std_dev,
             stability_pct,
             drop_ratio_pct,
+            controller_disconnects: disconnects,
+            thermal_throttled,
         }
     }
 
-    pub fn verdict_en(&self) -> &'static str {
-        if self.stability_pct >= 85.0 {
-            "Excellent (Highly Stable)"
+    pub fn verdict_en(&self) -> String {
+        if self.controller_disconnects > 0 {
+            format!("Overheat: controller dropped ({}x, recovered)", self.controller_disconnects)
+        } else if self.thermal_throttled {
+            format!("Thermal Throttle ({:.0}% stability, drops)", self.stability_pct)
+        } else if self.stability_pct >= 85.0 {
+            "Excellent (Highly Stable)".to_string()
         } else if self.stability_pct >= 70.0 {
-            "Good (Minor Fluctuations)"
+            "Good (Minor Fluctuations)".to_string()
         } else if self.stability_pct >= 45.0 {
-            "Fair (Noticeable Speed Drops)"
+            "Fair (Noticeable Speed Drops)".to_string()
         } else {
-            "Poor (Severe Throttling / Stalls)"
+            "Poor (Severe Throttling / Stalls)".to_string()
         }
     }
 
-    pub fn verdict_ru(&self) -> &'static str {
-        if self.stability_pct >= 85.0 {
-            "Отличная (Высокая стабильность)"
+    pub fn verdict_ru(&self) -> String {
+        if self.controller_disconnects > 0 {
+            format!("Перегрев: контроллер сбоил ({}x, восстановлен)", self.controller_disconnects)
+        } else if self.thermal_throttled {
+            format!("Термотроттлинг ({:.0}% стабильность, просадки)", self.stability_pct)
+        } else if self.stability_pct >= 85.0 {
+            "Отличная (Высокая стабильность)".to_string()
         } else if self.stability_pct >= 70.0 {
-            "Хорошая (Небольшие колебания)"
+            "Хорошая (Небольшие колебания)".to_string()
         } else if self.stability_pct >= 45.0 {
-            "Умеренная (Заметные просадки)"
+            "Умеренная (Заметные просадки)".to_string()
         } else {
-            "Низкая (Сильный троттлинг / задержки)"
+            "Низкая (Сильный троттлинг / задержки)".to_string()
         }
     }
 }
@@ -184,11 +238,13 @@ impl StabilityMetrics {
 pub struct BenchmarkResult {
     pub disk_number: u32,
     pub test_bytes: u64,
+    pub mode: BenchmarkMode,
     pub write_metrics: StabilityMetrics,
     pub write_samples: Vec<f32>,
     pub read_metrics: StabilityMetrics,
     pub read_samples: Vec<f32>,
     pub verify_errors: u64,
+    pub controller_disconnects: u32,
     pub total_elapsed_secs: f64,
     pub partitions_wiped: bool,
     pub error: Option<String>,
@@ -342,6 +398,7 @@ fn run_single_benchmark_worker(
     let mut result = BenchmarkResult {
         disk_number,
         test_bytes,
+        mode: config.mode,
         partitions_wiped: false,
         ..Default::default()
     };
@@ -444,6 +501,7 @@ fn run_single_benchmark_worker(
     let mut block_idx: u64 = 0;
     let mut last_sample_time = Instant::now();
     let mut bytes_since_sample: u64 = 0;
+    let mut controller_disconnects: u32 = 0;
 
     while written < test_bytes {
         if cancel_flag.load(Ordering::Relaxed) {
@@ -460,8 +518,59 @@ fn run_single_benchmark_worker(
 
         let write_res = write_file.write_all(&pattern_buf[..to_write]);
         if let Err(e) = write_res {
-            let err_msg = format!("Write error at {} MB: {}", written / 1_048_576, e);
+            if config.mode == BenchmarkMode::Detailed && controller_disconnects < 3 {
+                controller_disconnects += 1;
+                let _ = tx.send(BenchmarkEvent::Log(format!(
+                    "[#{}] [Thermal Diagnostic] Write error at {} MB: {}. Controller likely overheated/reset. Pausing 3s to cool down… (attempt {}/3)",
+                    disk_number, written / 1_048_576, e, controller_disconnects
+                )));
+
+                // Добавляем 0 МБ/с в сэмплы для наглядного отображения термического провала на графике
+                result.write_samples.push(0.0);
+                let _ = tx.send(BenchmarkEvent::SampleAdded {
+                    disk_number,
+                    is_write: true,
+                    speed_mbps: 0.0,
+                });
+
+                thread::sleep(Duration::from_millis(3000));
+
+                let mut recovered = false;
+                for retry in 1..=5 {
+                    if cancel_flag.load(Ordering::Relaxed) {
+                        let _ = crate::engine::set_disk_offline(disk_number, false);
+                        return;
+                    }
+                    let _ = crate::engine::unmount_all_volumes_on_disk(disk_number);
+                    let _ = crate::engine::set_disk_offline(disk_number, true);
+                    if let Ok(mut new_file) = crate::engine::open_drive_write(disk_number) {
+                        if new_file.seek(SeekFrom::Start(written)).is_ok() {
+                            write_file = new_file;
+                            recovered = true;
+                            let _ = tx.send(BenchmarkEvent::Log(format!(
+                                "[#{}] [Thermal Diagnostic] Controller cooled down & reconnected! Resuming write test from {} MB (retry {}/5)",
+                                disk_number, written / 1_048_576, retry
+                            )));
+                            last_sample_time = Instant::now();
+                            bytes_since_sample = 0;
+                            break;
+                        }
+                    }
+                    thread::sleep(Duration::from_millis(1000));
+                }
+
+                if recovered {
+                    continue;
+                }
+            }
+
+            let err_msg = if controller_disconnects > 0 {
+                format!("Controller overheated and dropped off bus at {} MB: {}", written / 1_048_576, e)
+            } else {
+                format!("Write error at {} MB: {}", written / 1_048_576, e)
+            };
             result.error = Some(err_msg.clone());
+            result.controller_disconnects = controller_disconnects;
             let _ = tx.send(BenchmarkEvent::PhaseChanged {
                 disk_number,
                 phase: BenchmarkPhase::Failed(err_msg),
@@ -511,15 +620,16 @@ fn run_single_benchmark_worker(
     crate::engine::sync_all();
 
     let write_duration = write_start.elapsed();
-    result.write_metrics = StabilityMetrics::compute(&result.write_samples, written, write_duration);
+    result.write_metrics = StabilityMetrics::compute(&result.write_samples, written, write_duration, controller_disconnects);
 
     let _ = tx.send(BenchmarkEvent::Log(format!(
-        "[#{}] [Benchmark] Write complete: avg {:.1} MB/s (min {:.1}, max {:.1}, stability {:.0}%)",
+        "[#{}] [Benchmark] Write complete: avg {:.1} MB/s (min {:.1}, max {:.1}, stability {:.0}%, overheat disconnects: {})",
         disk_number,
         result.write_metrics.avg_mbps,
         result.write_metrics.min_mbps,
         result.write_metrics.max_mbps,
-        result.write_metrics.stability_pct
+        result.write_metrics.stability_pct,
+        controller_disconnects
     )));
 
     if cancel_flag.load(Ordering::Relaxed) {
@@ -580,8 +690,52 @@ fn run_single_benchmark_worker(
         let to_read = (test_bytes - read_bytes).min(CHUNK_SIZE as u64) as usize;
         let read_res = read_file.read_exact(&mut read_buf[..to_read]);
         if let Err(e) = read_res {
+            if config.mode == BenchmarkMode::Detailed && controller_disconnects < 5 {
+                controller_disconnects += 1;
+                let _ = tx.send(BenchmarkEvent::Log(format!(
+                    "[#{}] [Thermal Diagnostic] Read error at {} MB: {}. Pausing 3s for controller cool-down…",
+                    disk_number, read_bytes / 1_048_576, e
+                )));
+
+                result.read_samples.push(0.0);
+                let _ = tx.send(BenchmarkEvent::SampleAdded {
+                    disk_number,
+                    is_write: false,
+                    speed_mbps: 0.0,
+                });
+
+                thread::sleep(Duration::from_millis(3000));
+
+                let mut recovered = false;
+                for _ in 1..=5 {
+                    if cancel_flag.load(Ordering::Relaxed) {
+                        let _ = crate::engine::set_disk_offline(disk_number, false);
+                        return;
+                    }
+                    if let Ok(mut new_file) = crate::device::open_drive_read(disk_number) {
+                        if new_file.seek(SeekFrom::Start(read_bytes)).is_ok() {
+                            read_file = new_file;
+                            recovered = true;
+                            let _ = tx.send(BenchmarkEvent::Log(format!(
+                                "[#{}] [Thermal Diagnostic] Reconnected! Resuming read test from {} MB",
+                                disk_number, read_bytes / 1_048_576
+                            )));
+                            last_read_sample = Instant::now();
+                            bytes_since_read_sample = 0;
+                            break;
+                        }
+                    }
+                    thread::sleep(Duration::from_millis(1000));
+                }
+
+                if recovered {
+                    continue;
+                }
+            }
+
             let err_msg = format!("Read error at {} MB: {}", read_bytes / 1_048_576, e);
             result.error = Some(err_msg.clone());
+            result.controller_disconnects = controller_disconnects;
             let _ = tx.send(BenchmarkEvent::PhaseChanged {
                 disk_number,
                 phase: BenchmarkPhase::Failed(err_msg),
@@ -633,7 +787,8 @@ fn run_single_benchmark_worker(
 
     let read_duration = read_start.elapsed();
     result.read_metrics =
-        StabilityMetrics::compute(&result.read_samples, read_bytes, read_duration);
+        StabilityMetrics::compute(&result.read_samples, read_bytes, read_duration, 0);
+    result.controller_disconnects = controller_disconnects;
     result.verify_errors = verify_errors;
     result.total_elapsed_secs = total_start.elapsed().as_secs_f64();
 
