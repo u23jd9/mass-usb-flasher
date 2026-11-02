@@ -1,6 +1,7 @@
 #![allow(dead_code)]
 
 pub mod app;
+pub mod benchmark;
 pub mod catalog;
 pub mod common;
 pub mod device;

@@ -3,9 +3,10 @@
 
 use std::time::{Duration, Instant};
 
-use eframe::egui::{self, Align, Color32, Layout, RichText, Rounding, Stroke, Vec2};
+use eframe::egui::{self, Align, Align2, Color32, Layout, RichText, Rounding, Stroke, Vec2};
 
 use mass_usb_flasher::app::{AppState, AppStatus, SlotStatus};
+use mass_usb_flasher::benchmark::{BenchmarkPhase, BenchmarkTestSize};
 use mass_usb_flasher::catalog::Catalog;
 use mass_usb_flasher::common::{
     compute_window_title, ensure_automount_enabled, ensure_elevated, format_elapsed,
@@ -131,11 +132,18 @@ pub enum UiScaleMode {
     Scale200,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AppTab {
+    Flashing,
+    Benchmark,
+}
+
 struct MufGuiApp {
     state: AppState,
     watcher: WatcherHandle,
     taskbar: Taskbar,
     theme: GuiTheme,
+    current_tab: AppTab,
     show_catalog_modal: bool,
     show_help_modal: bool,
     show_file_picker_modal: bool,
@@ -186,6 +194,7 @@ impl MufGuiApp {
             watcher,
             taskbar: Taskbar::new(),
             theme,
+            current_tab: AppTab::Flashing,
             show_catalog_modal: false,
             show_help_modal: false,
             show_file_picker_modal: false,
@@ -262,6 +271,7 @@ impl eframe::App for MufGuiApp {
         self.state.drain_prepare();
         self.state.drain_write();
         self.state.drain_single_retries();
+        self.state.drain_benchmark();
         self.state.auto_transition_finished();
         self.update_taskbar();
 
@@ -270,13 +280,14 @@ impl eframe::App for MufGuiApp {
             &self.state,
         )));
 
-        // Во время записи или хеширования перерисовываем чаще
+        // Во время записи, бенчмарка или хеширования перерисовываем чаще
         if matches!(self.state.status, AppStatus::Running)
             || self.state.image_hash_progress.is_some()
             || self.state.import_job.is_some()
             || self.state.has_active_retries()
+            || self.state.benchmark_active
         {
-            ctx.request_repaint_after(Duration::from_millis(100));
+            ctx.request_repaint_after(Duration::from_millis(50));
         }
 
         let colors = self.theme.colors();
@@ -293,7 +304,7 @@ impl eframe::App for MufGuiApp {
             }
         });
 
-        // --- ВЕРХНЯЯ ПАНЕЛЬ (Header & Image Controls) ---
+        // --- ВЕРХНЯЯ ПАНЕЛЬ (Header & Image/Benchmark Controls) ---
         egui::TopBottomPanel::top("top_panel")
             .frame(
                 egui::Frame::none()
@@ -303,7 +314,10 @@ impl eframe::App for MufGuiApp {
             .show(ctx, |ui| {
                 self.render_top_bar(ui);
                 ui.add_space(8.0);
-                self.render_image_card(ui);
+                match self.current_tab {
+                    AppTab::Flashing => self.render_image_card(ui),
+                    AppTab::Benchmark => self.render_benchmark_top_card(ui),
+                }
             });
 
         // --- НИЖНЯЯ ПАНЕЛЬ ДЕЙСТВИЙ (Start, Reset, Help, Status) ---
@@ -314,7 +328,10 @@ impl eframe::App for MufGuiApp {
                     .inner_margin(12.0),
             )
             .show(ctx, |ui| {
-                self.render_bottom_bar(ui);
+                match self.current_tab {
+                    AppTab::Flashing => self.render_bottom_bar(ui),
+                    AppTab::Benchmark => self.render_benchmark_bottom_bar(ui),
+                }
             });
 
         // --- ПАНЕЛЬ ЛОГА (Activity Log: docked above bottom bar, resizable) ---
@@ -336,7 +353,7 @@ impl eframe::App for MufGuiApp {
         }
 
         // --- САЙД-ПАНЕЛЬ БИБЛИОТЕКИ ОБРАЗОВ (Коллапсируемая панель слева) ---
-        if self.show_images_sidebar {
+        if self.show_images_sidebar && self.current_tab == AppTab::Flashing {
             egui::SidePanel::left("images_sidebar_panel")
                 .resizable(true)
                 .default_width(280.0)
@@ -353,9 +370,12 @@ impl eframe::App for MufGuiApp {
                 });
         }
 
-        // --- ЦЕНТРАЛЬНАЯ ПАНЕЛЬ (Таблица устройств) ---
+        // --- ЦЕНТРАЛЬНАЯ ПАНЕЛЬ (Таблица устройств / Бенчмарк) ---
         egui::CentralPanel::default().show(ctx, |ui| {
-            self.render_devices_table(ui);
+            match self.current_tab {
+                AppTab::Flashing => self.render_devices_table(ui),
+                AppTab::Benchmark => self.render_benchmark_table(ui),
+            }
         });
 
         // --- МОДАЛЬНЫЕ ОКНА ---
@@ -386,78 +406,139 @@ impl MufGuiApp {
 
             ui.add_space(8.0);
 
-            // Кнопка переключения сайдбара библиотеки образов
+            // --- TAB SWITCHER ---
+            let is_flashing = self.current_tab == AppTab::Flashing;
             if ui
                 .selectable_label(
-                    self.show_images_sidebar,
-                    RichText::new(format!("{} ({})", t.gui_sidebar_toggle, self.state.catalog.images.len()))
-                        .strong(),
+                    is_flashing,
+                    RichText::new(format!("🔥 {}", t.tab_flashing)).strong().size(13.5),
                 )
                 .clicked()
             {
-                self.show_images_sidebar = !self.show_images_sidebar;
+                self.current_tab = AppTab::Flashing;
             }
 
-            ui.add_space(10.0);
-
-            // Статус-бейдж
-            let (status_text, bg_color, fg_color) = match self.state.status {
-                AppStatus::Idle => (t.status_idle, Color32::from_rgb(60, 60, 70), Color32::WHITE),
-                AppStatus::WaitingForDevices => (
-                    t.status_waiting,
-                    Color32::from_rgb(180, 110, 0),
-                    Color32::WHITE,
-                ),
-                AppStatus::Ready => (
-                    t.status_ready,
-                    Color32::from_rgb(34, 139, 34),
-                    Color32::WHITE,
-                ),
-                AppStatus::Running => (
-                    t.status_running,
-                    Color32::from_rgb(25, 118, 210),
-                    Color32::WHITE,
-                ),
-                AppStatus::Finished => (
-                    t.status_finished,
-                    Color32::from_rgb(142, 36, 170),
-                    Color32::WHITE,
-                ),
-            };
-
-            egui::Frame::none()
-                .fill(bg_color)
-                .rounding(Rounding::same(4.0))
-                .inner_margin(egui::Margin::symmetric(10.0, 4.0))
-                .show(ui, |ui| {
-                    ui.label(RichText::new(status_text).strong().color(fg_color));
-                });
-
-            // Управление целевым количеством + Автотаргет
-            ui.add_space(16.0);
-            ui.label(RichText::new(t.lbl_target).strong());
-            if ui.button("➖").clicked() {
-                self.state.decrease_target();
-            }
-            ui.label(
-                RichText::new(format!("{}", self.state.target_count))
-                    .strong()
-                    .size(16.0)
-                    .color(Color32::from_rgb(255, 215, 0)),
-            );
-            if ui.button("➕").clicked() {
-                self.state.increase_target();
-            }
-
-            let auto_color = if self.state.autotarget {
-                Color32::from_rgb(76, 175, 80)
+            let is_bench = self.current_tab == AppTab::Benchmark;
+            let bench_label = if self.state.benchmark_active {
+                format!("⚡ {} ●", t.tab_benchmark)
             } else {
-                Color32::from_rgb(130, 135, 145)
+                format!("⚡ {}", t.tab_benchmark)
             };
             if ui
-                .small_button(RichText::new(format!("[{}]", t.gui_autotarget_btn)).color(auto_color).strong())
-                .on_hover_text("Auto-target: matches total connected USB drives automatically")
+                .selectable_label(
+                    is_bench,
+                    RichText::new(bench_label)
+                        .strong()
+                        .size(13.5)
+                        .color(if self.state.benchmark_active {
+                            Color32::from_rgb(255, 193, 7)
+                        } else if is_bench {
+                            Color32::from_rgb(100, 200, 255)
+                        } else {
+                            Color32::from_rgb(200, 205, 215)
+                        }),
+                )
                 .clicked()
+            {
+                self.current_tab = AppTab::Benchmark;
+            }
+
+            ui.add_space(8.0);
+
+            if self.current_tab == AppTab::Flashing {
+                // Кнопка переключения сайдбара библиотеки образов
+                if ui
+                    .selectable_label(
+                        self.show_images_sidebar,
+                        RichText::new(format!("{} ({})", t.gui_sidebar_toggle, self.state.catalog.images.len()))
+                            .strong(),
+                    )
+                    .clicked()
+                {
+                    self.show_images_sidebar = !self.show_images_sidebar;
+                }
+
+                ui.add_space(10.0);
+
+                // Статус-бейдж
+                let (status_text, bg_color, fg_color) = match self.state.status {
+                    AppStatus::Idle => (t.status_idle, Color32::from_rgb(60, 60, 70), Color32::WHITE),
+                    AppStatus::WaitingForDevices => (
+                        t.status_waiting,
+                        Color32::from_rgb(180, 110, 0),
+                        Color32::WHITE,
+                    ),
+                    AppStatus::Ready => (
+                        t.status_ready,
+                        Color32::from_rgb(34, 139, 34),
+                        Color32::WHITE,
+                    ),
+                    AppStatus::Running => (
+                        t.status_running,
+                        Color32::from_rgb(25, 118, 210),
+                        Color32::WHITE,
+                    ),
+                    AppStatus::Finished => (
+                        t.status_finished,
+                        Color32::from_rgb(142, 36, 170),
+                        Color32::WHITE,
+                    ),
+                };
+
+                egui::Frame::none()
+                    .fill(bg_color)
+                    .rounding(Rounding::same(4.0))
+                    .inner_margin(egui::Margin::symmetric(10.0, 4.0))
+                    .show(ui, |ui| {
+                        ui.label(RichText::new(status_text).strong().color(fg_color));
+                    });
+
+                // Управление целевым количеством + Автотаргет
+                ui.add_space(16.0);
+                ui.label(RichText::new(t.lbl_target).strong());
+                if ui.button("➖").clicked() {
+                    self.state.decrease_target();
+                }
+                ui.label(
+                    RichText::new(format!("{}", self.state.target_count))
+                        .strong()
+                        .size(16.0)
+                        .color(Color32::from_rgb(255, 215, 0)),
+                );
+                if ui.button("➕").clicked() {
+                    self.state.increase_target();
+                }
+
+                let auto_color = if self.state.autotarget {
+                    Color32::from_rgb(76, 175, 80)
+                } else {
+                    Color32::from_rgb(130, 135, 145)
+                };
+                if ui
+                    .small_button(RichText::new(format!("[{}]", t.gui_autotarget_btn)).color(auto_color).strong())
+                    .on_hover_text("Auto-target: matches total connected USB drives automatically")
+                    .clicked()
+                {
+                    self.state.enable_autotarget();
+                }
+            } else {
+                // Статус-бейдж для вкладки бенчмарка
+                let (status_text, bg_color, fg_color) = if self.state.benchmark_active {
+                    (t.bench_summary_running, Color32::from_rgb(180, 110, 0), Color32::WHITE)
+                } else if self.state.devices.is_empty() {
+                    (t.bench_no_devices, Color32::from_rgb(60, 60, 70), Color32::WHITE)
+                } else {
+                    (t.bench_status_idle, Color32::from_rgb(34, 139, 34), Color32::WHITE)
+                };
+
+                egui::Frame::none()
+                    .fill(bg_color)
+                    .rounding(Rounding::same(4.0))
+                    .inner_margin(egui::Margin::symmetric(10.0, 4.0))
+                    .show(ui, |ui| {
+                        ui.label(RichText::new(status_text).strong().color(fg_color));
+                    });
+            }
             {
                 self.state.enable_autotarget();
             }
@@ -601,6 +682,111 @@ impl MufGuiApp {
                     } else {
                         ui.label(RichText::new("—").weak());
                     }
+                });
+            });
+    }
+
+    fn render_benchmark_top_card(&mut self, ui: &mut egui::Ui) {
+        let t = self.state.t();
+        let colors = self.theme.colors();
+        egui::Frame::none()
+            .fill(colors.card_bg)
+            .stroke(Stroke::new(1.0_f32, colors.card_stroke))
+            .rounding(Rounding::same(6.0))
+            .inner_margin(10.0)
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.vertical(|ui| {
+                        ui.label(
+                            RichText::new(t.bench_title)
+                                .strong()
+                                .size(14.0)
+                                .color(Color32::from_rgb(100, 200, 255)),
+                        );
+                        ui.label(
+                            RichText::new(t.bench_subtitle)
+                                .size(11.0)
+                                .weak(),
+                        );
+                    });
+
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        // Главная кнопка запуска / остановки бенчмарка
+                        if self.state.benchmark_active {
+                            let stop_btn = egui::Button::new(
+                                RichText::new(t.bench_btn_stop)
+                                    .size(14.0)
+                                    .strong()
+                                    .color(Color32::WHITE),
+                            )
+                            .fill(Color32::from_rgb(211, 47, 47))
+                            .min_size(Vec2::new(170.0, 34.0));
+
+                            if ui.add(stop_btn).clicked() {
+                                self.state.stop_benchmark();
+                            }
+                        } else {
+                            let can_start = !self.state.devices.is_empty()
+                                && self.state.status != AppStatus::Running;
+                            let start_btn = egui::Button::new(
+                                RichText::new(t.bench_btn_run_all)
+                                    .size(14.0)
+                                    .strong()
+                                    .color(if can_start { Color32::WHITE } else { Color32::from_rgb(140, 140, 140) }),
+                            )
+                            .fill(if can_start { Color32::from_rgb(46, 125, 50) } else { Color32::from_rgb(45, 50, 45) })
+                            .min_size(Vec2::new(180.0, 34.0));
+
+                            if ui
+                                .add_enabled(can_start, start_btn)
+                                .on_hover_text("Wipes partition table on all ready drives and runs full write + read speed & stability benchmark")
+                                .clicked()
+                            {
+                                self.state.start_benchmark_all();
+                            }
+                        }
+
+                        ui.add_space(14.0);
+
+                        // Чекбокс затирания таблицы разделов
+                        ui.checkbox(
+                            &mut self.state.benchmark_config.wipe_partitions,
+                            RichText::new(t.bench_wipe_partitions).strong().size(12.0),
+                        ).on_hover_text("Crucial: writes zeroes to sector 0 (MBR/GPT) and backup GPT at the end of the disk so OS releases volume locks");
+
+                        ui.add_space(10.0);
+
+                        // Выбор объёма теста
+                        let lang = self.state.lang;
+                        let current_size_label = match lang {
+                            mass_usb_flasher::i18n::Lang::Ru => self.state.benchmark_config.test_size.label_ru(),
+                            mass_usb_flasher::i18n::Lang::En => self.state.benchmark_config.test_size.label_en(),
+                        };
+
+                        egui::ComboBox::from_id_salt("bench_test_size_combo")
+                            .selected_text(current_size_label)
+                            .show_ui(ui, |ui| {
+                                for &size in &[
+                                    BenchmarkTestSize::Size256MB,
+                                    BenchmarkTestSize::Size512MB,
+                                    BenchmarkTestSize::Size1GB,
+                                    BenchmarkTestSize::Size2GB,
+                                    BenchmarkTestSize::Size4GB,
+                                    BenchmarkTestSize::FullDisk,
+                                ] {
+                                    let label = match lang {
+                                        mass_usb_flasher::i18n::Lang::Ru => size.label_ru(),
+                                        mass_usb_flasher::i18n::Lang::En => size.label_en(),
+                                    };
+                                    ui.selectable_value(
+                                        &mut self.state.benchmark_config.test_size,
+                                        size,
+                                        label,
+                                    );
+                                }
+                            });
+                        ui.label(RichText::new(t.bench_test_size).strong());
+                    });
                 });
             });
     }
@@ -928,6 +1114,377 @@ impl MufGuiApp {
         if let Some(disk_num) = stop_beacon_slot {
             self.state.stop_beacon(disk_num);
         }
+    }
+
+    fn render_benchmark_table(&mut self, ui: &mut egui::Ui) {
+        let t = self.state.t();
+        let colors = self.theme.colors();
+        let total_count = self.state.devices.len();
+        let active_count = self.state.benchmark_drives.values().filter(|d| d.is_active).count();
+
+        ui.horizontal(|ui| {
+            ui.heading(RichText::new(t.tab_benchmark).size(17.0).strong());
+            ui.label(
+                RichText::new(format!(
+                    "({} connected, {} testing)",
+                    total_count, active_count
+                ))
+                .weak(),
+            );
+        });
+
+        ui.add_space(6.0);
+
+        if self.state.devices.is_empty() {
+            egui::Frame::none()
+                .fill(colors.empty_box_bg)
+                .stroke(Stroke::new(1.0_f32, colors.card_stroke))
+                .rounding(Rounding::same(6.0))
+                .inner_margin(40.0)
+                .show(ui, |ui| {
+                    ui.vertical_centered(|ui| {
+                        ui.label(
+                            RichText::new("⚡")
+                                .size(36.0)
+                                .color(colors.empty_icon_color),
+                        );
+                        ui.add_space(8.0);
+                        ui.label(RichText::new(t.bench_no_devices).size(15.0).weak());
+                    });
+                });
+            return;
+        }
+
+        let mut start_bench_single = None;
+        let mut stop_bench = false;
+
+        egui::ScrollArea::vertical()
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                egui::Grid::new("benchmark_grid")
+                    .striped(true)
+                    .spacing(Vec2::new(14.0, 10.0))
+                    .min_col_width(50.0)
+                    .show(ui, |ui| {
+                        // Headers
+                        ui.label(RichText::new(t.bench_col_device).strong().weak());
+                        ui.label(RichText::new(t.bench_col_status).strong().weak());
+                        ui.label(RichText::new(t.bench_col_write).strong().weak());
+                        ui.label(RichText::new(t.bench_col_stability).strong().weak());
+                        ui.label(RichText::new(t.bench_col_read).strong().weak());
+                        ui.label(RichText::new(t.bench_col_integrity).strong().weak());
+                        ui.label(RichText::new("Stability Graph").strong().weak());
+                        ui.label(RichText::new(t.bench_col_actions).strong().weak());
+                        ui.end_row();
+
+                        for (n, slot) in &self.state.devices {
+                            let gb = slot.info.size_bytes as f64 / (1024.0 * 1024.0 * 1024.0);
+                            let bench_state = self.state.benchmark_drives.get(n);
+
+                            // Col 1: Device
+                            ui.vertical(|ui| {
+                                ui.horizontal(|ui| {
+                                    ui.label(RichText::new(format!("#{}", n)).strong().color(Color32::from_rgb(100, 200, 255)));
+                                    ui.label(RichText::new(format!("{:.2} GB", gb)).strong());
+                                });
+                                ui.label(RichText::new(&slot.info.product).size(11.5).strong());
+                                ui.label(RichText::new(&slot.info.path).monospace().size(10.5).weak());
+                            });
+
+                            // Col 2: Status / Progress
+                            let phase = bench_state.map(|s| &s.phase).unwrap_or(&BenchmarkPhase::Idle);
+                            let progress = bench_state.map(|s| s.progress).unwrap_or(0.0);
+                            let is_active = bench_state.map(|s| s.is_active).unwrap_or(false);
+
+                            let (status_text, status_color) = match phase {
+                                BenchmarkPhase::Idle => (t.bench_status_idle, Color32::from_rgb(120, 120, 130)),
+                                BenchmarkPhase::WipingPartitions => (t.bench_status_wiping, Color32::from_rgb(255, 152, 0)),
+                                BenchmarkPhase::Writing => (t.bench_status_writing, Color32::from_rgb(33, 150, 243)),
+                                BenchmarkPhase::Flushing => (t.bench_status_flushing, Color32::from_rgb(156, 39, 176)),
+                                BenchmarkPhase::Reading => (t.bench_status_reading, Color32::from_rgb(0, 150, 136)),
+                                BenchmarkPhase::Done => (t.bench_status_done, Color32::from_rgb(76, 175, 80)),
+                                BenchmarkPhase::Failed(_) => (t.bench_status_failed, Color32::from_rgb(244, 67, 54)),
+                                BenchmarkPhase::Cancelled => (t.bench_status_cancelled, Color32::from_rgb(255, 179, 0)),
+                            };
+
+                            ui.vertical(|ui| {
+                                egui::Frame::none()
+                                    .fill(status_color.linear_multiply(0.2))
+                                    .stroke(Stroke::new(1.0_f32, status_color))
+                                    .rounding(Rounding::same(4.0))
+                                    .inner_margin(egui::Margin::symmetric(6.0, 2.0))
+                                    .show(ui, |ui| {
+                                        ui.label(RichText::new(status_text).color(status_color).strong().size(11.5));
+                                    });
+
+                                ui.add_space(2.0);
+                                if is_active || matches!(phase, BenchmarkPhase::Done) {
+                                    ui.add(
+                                        egui::ProgressBar::new(progress)
+                                            .desired_width(130.0)
+                                            .desired_height(12.0)
+                                            .animate(is_active)
+                                            .text(format!("{:.0}%", progress * 100.0)),
+                                    );
+                                }
+                            });
+
+                            // Col 3: Write Performance
+                            let result = bench_state.and_then(|s| s.result.as_ref());
+                            ui.vertical(|ui| {
+                                if let Some(res) = result {
+                                    ui.label(
+                                        RichText::new(format!("{:.1} MB/s", res.write_metrics.avg_mbps))
+                                            .strong()
+                                            .color(Color32::from_rgb(255, 152, 0)),
+                                    );
+                                    ui.label(
+                                        RichText::new(format!(
+                                            "min {:.1} | max {:.1}",
+                                            res.write_metrics.min_mbps, res.write_metrics.max_mbps
+                                        ))
+                                        .size(10.5)
+                                        .weak(),
+                                    );
+                                } else if let Some(bs) = bench_state {
+                                    if bs.phase == BenchmarkPhase::Writing && bs.current_speed_mbps > 0.0 {
+                                        ui.label(
+                                            RichText::new(format!("⚡ {:.1} MB/s", bs.current_speed_mbps))
+                                                .strong()
+                                                .color(Color32::from_rgb(255, 152, 0)),
+                                        );
+                                    } else {
+                                        ui.label(RichText::new("—").weak());
+                                    }
+                                } else {
+                                    ui.label(RichText::new("—").weak());
+                                }
+                            });
+
+                            // Col 4: Write Stability
+                            ui.vertical(|ui| {
+                                if let Some(res) = result {
+                                    let stab = res.write_metrics.stability_pct;
+                                    let stab_color = if stab >= 80.0 {
+                                        Color32::from_rgb(76, 175, 80)
+                                    } else if stab >= 60.0 {
+                                        Color32::from_rgb(255, 193, 7)
+                                    } else {
+                                        Color32::from_rgb(244, 67, 54)
+                                    };
+
+                                    let verdict = match self.state.lang {
+                                        mass_usb_flasher::i18n::Lang::Ru => res.write_metrics.verdict_ru(),
+                                        mass_usb_flasher::i18n::Lang::En => res.write_metrics.verdict_en(),
+                                    };
+
+                                    ui.label(
+                                        RichText::new(format!("{:.0}%", stab))
+                                            .strong()
+                                            .color(stab_color),
+                                    );
+                                    ui.label(RichText::new(verdict).size(10.5).color(stab_color));
+                                } else {
+                                    ui.label(RichText::new("—").weak());
+                                }
+                            });
+
+                            // Col 5: Read Performance & Stability
+                            ui.vertical(|ui| {
+                                if let Some(res) = result {
+                                    ui.label(
+                                        RichText::new(format!("{:.1} MB/s", res.read_metrics.avg_mbps))
+                                            .strong()
+                                            .color(Color32::from_rgb(0, 230, 118)),
+                                    );
+                                    ui.label(
+                                        RichText::new(format!(
+                                            "min {:.1} | max {:.1} (stab {:.0}%)",
+                                            res.read_metrics.min_mbps, res.read_metrics.max_mbps, res.read_metrics.stability_pct
+                                        ))
+                                        .size(10.5)
+                                        .weak(),
+                                    );
+                                } else if let Some(bs) = bench_state {
+                                    if bs.phase == BenchmarkPhase::Reading && bs.current_speed_mbps > 0.0 {
+                                        ui.label(
+                                            RichText::new(format!("⚡ {:.1} MB/s", bs.current_speed_mbps))
+                                                .strong()
+                                                .color(Color32::from_rgb(0, 230, 118)),
+                                        );
+                                    } else {
+                                        ui.label(RichText::new("—").weak());
+                                    }
+                                } else {
+                                    ui.label(RichText::new("—").weak());
+                                }
+                            });
+
+                            // Col 6: Integrity
+                            ui.vertical(|ui| {
+                                if let Some(res) = result {
+                                    if res.verify_errors == 0 {
+                                        ui.label(
+                                            RichText::new(t.bench_integrity_ok)
+                                                .strong()
+                                                .color(Color32::from_rgb(76, 175, 80))
+                                                .size(11.5),
+                                        );
+                                    } else {
+                                        ui.label(
+                                            RichText::new(format!("❌ {} ERRORS", res.verify_errors))
+                                                .strong()
+                                                .color(Color32::from_rgb(244, 67, 54))
+                                                .size(11.5),
+                                        );
+                                    }
+                                    if res.partitions_wiped {
+                                        ui.label(RichText::new("MBR/GPT wiped ✔").weak().size(10.0));
+                                    }
+                                } else {
+                                    ui.label(RichText::new("—").weak());
+                                }
+                            });
+
+                            // Col 7: Speed Stability Sparkline Graph
+                            let empty_samples = Vec::new();
+                            let write_samples = result
+                                .map(|r| &r.write_samples)
+                                .or_else(|| bench_state.map(|s| &s.live_write_samples))
+                                .unwrap_or(&empty_samples);
+                            let read_samples = result
+                                .map(|r| &r.read_samples)
+                                .or_else(|| bench_state.map(|s| &s.live_read_samples))
+                                .unwrap_or(&empty_samples);
+
+                            ui.vertical(|ui| {
+                                draw_speed_sparkline(ui, write_samples, read_samples, 150.0, 34.0);
+                                ui.horizontal(|ui| {
+                                    ui.label(RichText::new("■ Write").size(9.5).color(Color32::from_rgb(255, 152, 0)));
+                                    ui.label(RichText::new("■ Read").size(9.5).color(Color32::from_rgb(0, 230, 118)));
+                                });
+                            });
+
+                            // Col 8: Actions
+                            ui.vertical(|ui| {
+                                if is_active {
+                                    if ui.small_button(RichText::new(t.bench_btn_stop).color(Color32::from_rgb(255, 100, 100))).clicked() {
+                                        stop_bench = true;
+                                    }
+                                } else {
+                                    let btn = egui::Button::new(
+                                        RichText::new(t.bench_btn_single)
+                                            .strong()
+                                            .color(Color32::from_rgb(100, 200, 255)),
+                                    );
+                                    if ui.add_enabled(!self.state.benchmark_active, btn).on_hover_text("Wipes partition table and runs benchmark on this drive").clicked() {
+                                        start_bench_single = Some(*n);
+                                    }
+                                }
+                            });
+
+                            ui.end_row();
+                        }
+                    });
+            });
+
+        if let Some(disk_num) = start_bench_single {
+            self.state.start_benchmark_single(disk_num);
+        }
+        if stop_bench {
+            self.state.stop_benchmark();
+        }
+    }
+
+    fn render_benchmark_bottom_bar(&mut self, ui: &mut egui::Ui) {
+        let t = self.state.t();
+
+        // Banner if benchmark is active or finished
+        if self.state.benchmark_active {
+            egui::Frame::none()
+                .fill(Color32::from_rgb(28, 55, 90))
+                .rounding(Rounding::same(6.0))
+                .inner_margin(egui::Margin::symmetric(14.0, 7.0))
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            RichText::new("⚡ FLASH DRIVE BENCHMARK IN PROGRESS… TESTING WRITE & READ STABILITY")
+                                .strong()
+                                .size(13.5)
+                                .color(Color32::from_rgb(100, 200, 255)),
+                        );
+                    });
+                });
+            ui.add_space(6.0);
+        } else if self.state.benchmark_drives.values().any(|d| d.result.is_some()) {
+            egui::Frame::none()
+                .fill(Color32::from_rgb(34, 90, 50))
+                .rounding(Rounding::same(6.0))
+                .inner_margin(egui::Margin::symmetric(14.0, 7.0))
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            RichText::new(t.bench_summary_finished)
+                                .strong()
+                                .size(13.5)
+                                .color(Color32::WHITE),
+                        );
+                    });
+                });
+            ui.add_space(6.0);
+        }
+
+        ui.horizontal(|ui| {
+            if self.state.benchmark_active {
+                let stop_btn = egui::Button::new(
+                    RichText::new(t.bench_btn_stop)
+                        .size(15.0)
+                        .strong()
+                        .color(Color32::WHITE),
+                )
+                .fill(Color32::from_rgb(211, 47, 47))
+                .min_size(Vec2::new(180.0, 36.0));
+
+                if ui.add(stop_btn).clicked() {
+                    self.state.stop_benchmark();
+                }
+            } else {
+                let can_start = !self.state.devices.is_empty() && self.state.status != AppStatus::Running;
+                let start_btn = egui::Button::new(
+                    RichText::new(t.bench_btn_run_all)
+                        .size(15.0)
+                        .strong()
+                        .color(if can_start { Color32::WHITE } else { Color32::from_rgb(140, 140, 140) }),
+                )
+                .fill(if can_start { Color32::from_rgb(46, 125, 50) } else { Color32::from_rgb(45, 50, 45) })
+                .min_size(Vec2::new(180.0, 36.0));
+
+                if ui.add_enabled(can_start, start_btn).clicked() {
+                    self.state.start_benchmark_all();
+                }
+            }
+
+            ui.add_space(10.0);
+
+            if ui.button(if self.show_log_panel { "📜 Hide Log" } else { "📜 Log" }).clicked() {
+                self.show_log_panel = !self.show_log_panel;
+            }
+
+            if ui.button("❓ Help").clicked() {
+                self.show_help_modal = true;
+            }
+
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                if ui.button(RichText::new(t.fk_quit).color(Color32::from_rgb(255, 100, 100))).clicked() {
+                    std::process::exit(0);
+                }
+
+                ui.hyperlink_to(
+                    RichText::new(WATERMARK).weak().size(12.0),
+                    WATERMARK_URL,
+                );
+            });
+        });
     }
 
     fn render_bottom_bar(&mut self, ui: &mut egui::Ui) {
@@ -1311,6 +1868,82 @@ impl MufGuiApp {
 
         if !open {
             self.show_file_picker_modal = false;
+        }
+    }
+}
+
+fn draw_speed_sparkline(
+    ui: &mut egui::Ui,
+    write_samples: &[f32],
+    read_samples: &[f32],
+    width: f32,
+    height: f32,
+) {
+    let desired_size = Vec2::new(width, height);
+    let (rect, _resp) = ui.allocate_exact_size(desired_size, egui::Sense::hover());
+    let painter = ui.painter_at(rect);
+
+    // Фоновая плашка
+    painter.rect_filled(rect, Rounding::same(3.0), Color32::from_rgb(20, 22, 28));
+    painter.rect_stroke(
+        rect,
+        Rounding::same(3.0),
+        Stroke::new(1.0_f32, Color32::from_rgb(45, 48, 58)),
+    );
+
+    if write_samples.is_empty() && read_samples.is_empty() {
+        painter.text(
+            rect.center(),
+            Align2::CENTER_CENTER,
+            "No data",
+            egui::FontId::proportional(10.0),
+            Color32::from_rgb(90, 95, 110),
+        );
+        return;
+    }
+
+    let mut max_speed = 10.0f32;
+    for &s in write_samples.iter().chain(read_samples.iter()) {
+        if s > max_speed {
+            max_speed = s;
+        }
+    }
+
+    // Линия скорости записи (оранжевая)
+    if write_samples.len() >= 2 {
+        let n = write_samples.len();
+        let points: Vec<egui::Pos2> = write_samples
+            .iter()
+            .enumerate()
+            .map(|(i, &v)| {
+                let x = rect.left() + 2.0 + (i as f32 / (n - 1) as f32) * (rect.width() - 4.0);
+                let norm = (v / max_speed).clamp(0.0, 1.0);
+                let y = rect.bottom() - 2.0 - norm * (rect.height() - 4.0);
+                egui::pos2(x, y)
+            })
+            .collect();
+
+        for w in points.windows(2) {
+            painter.line_segment([w[0], w[1]], Stroke::new(1.5_f32, Color32::from_rgb(255, 152, 0)));
+        }
+    }
+
+    // Линия скорости чтения (зеленая/бирюзовая)
+    if read_samples.len() >= 2 {
+        let n = read_samples.len();
+        let points: Vec<egui::Pos2> = read_samples
+            .iter()
+            .enumerate()
+            .map(|(i, &v)| {
+                let x = rect.left() + 2.0 + (i as f32 / (n - 1) as f32) * (rect.width() - 4.0);
+                let norm = (v / max_speed).clamp(0.0, 1.0);
+                let y = rect.bottom() - 2.0 - norm * (rect.height() - 4.0);
+                egui::pos2(x, y)
+            })
+            .collect();
+
+        for w in points.windows(2) {
+            painter.line_segment([w[0], w[1]], Stroke::new(1.5_f32, Color32::from_rgb(0, 230, 118)));
         }
     }
 }

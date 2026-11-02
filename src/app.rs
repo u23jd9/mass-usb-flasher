@@ -5,6 +5,7 @@ use std::thread;
 use std::time::Instant;
 
 use crate::catalog::{spawn_folder_import, unix_now, Catalog, ImageEntry, ImportProgress};
+use crate::benchmark::{BenchmarkConfig, BenchmarkDriveState, BenchmarkEvent, BenchmarkPhase};
 use crate::device::watcher::{DeviceEvent, WatcherHandle};
 use crate::device::DiskInfo;
 use crate::engine::writer::{start_write, WriteEvent};
@@ -132,6 +133,12 @@ pub struct AppState {
     pub file_picker_selected: usize,
 
     pub log: Vec<String>,
+
+    pub benchmark_drives: BTreeMap<u32, BenchmarkDriveState>,
+    pub benchmark_config: BenchmarkConfig,
+    pub benchmark_rx: Option<Receiver<BenchmarkEvent>>,
+    pub benchmark_cancel_flag: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    pub benchmark_active: bool,
 }
 
 impl Default for AppState {
@@ -186,6 +193,12 @@ impl Default for AppState {
             file_picker_selected: 0,
 
             log: Vec::new(),
+
+            benchmark_drives: BTreeMap::new(),
+            benchmark_config: BenchmarkConfig::default(),
+            benchmark_rx: None,
+            benchmark_cancel_flag: None,
+            benchmark_active: false,
         }
     }
 }
@@ -231,6 +244,11 @@ impl AppState {
                     }
                 } else {
                     self.devices.remove(&number);
+                    if let Some(drive) = self.benchmark_drives.get_mut(&number) {
+                        if !drive.is_active {
+                            self.benchmark_drives.remove(&number);
+                        }
+                    }
                     self.recompute_status();
                 }
             }
@@ -244,6 +262,10 @@ impl AppState {
             "[+] #{} {} ({:.2} GB) SN={}",
             n, info.product, gb, info.serial
         ));
+
+        self.benchmark_drives
+            .entry(n)
+            .or_insert_with(|| BenchmarkDriveState::new(n));
 
         // Проверяем, было ли уже это устройство (по номеру или серийному номеру)
         let existing_number = if self.devices.contains_key(&n) {
@@ -914,6 +936,209 @@ impl AppState {
         }
 
         self.auto_transition_finished();
+    }
+
+    pub fn drain_benchmark(&mut self) {
+        let Some(rx) = self.benchmark_rx.take() else {
+            return;
+        };
+
+        let mut keep = true;
+        let mut any_active = false;
+
+        loop {
+            match rx.try_recv() {
+                Ok(BenchmarkEvent::Log(msg)) => {
+                    self.push_log(msg);
+                }
+                Ok(BenchmarkEvent::PhaseChanged { disk_number, phase }) => {
+                    let entry = self
+                        .benchmark_drives
+                        .entry(disk_number)
+                        .or_insert_with(|| BenchmarkDriveState::new(disk_number));
+                    entry.phase = phase;
+                }
+                Ok(BenchmarkEvent::Progress {
+                    disk_number,
+                    phase,
+                    overall_progress,
+                    current_speed_mbps,
+                    bytes_done,
+                    total_bytes,
+                }) => {
+                    let entry = self
+                        .benchmark_drives
+                        .entry(disk_number)
+                        .or_insert_with(|| BenchmarkDriveState::new(disk_number));
+                    entry.phase = phase;
+                    entry.progress = overall_progress;
+                    entry.current_speed_mbps = current_speed_mbps;
+                    entry.bytes_done = bytes_done;
+                    entry.total_bytes = total_bytes;
+                    entry.is_active = true;
+                }
+                Ok(BenchmarkEvent::SampleAdded {
+                    disk_number,
+                    is_write,
+                    speed_mbps,
+                }) => {
+                    let entry = self
+                        .benchmark_drives
+                        .entry(disk_number)
+                        .or_insert_with(|| BenchmarkDriveState::new(disk_number));
+                    if is_write {
+                        entry.live_write_samples.push(speed_mbps);
+                    } else {
+                        entry.live_read_samples.push(speed_mbps);
+                    }
+                }
+                Ok(BenchmarkEvent::Finished { disk_number, result }) => {
+                    let entry = self
+                        .benchmark_drives
+                        .entry(disk_number)
+                        .or_insert_with(|| BenchmarkDriveState::new(disk_number));
+                    entry.phase = BenchmarkPhase::Done;
+                    entry.progress = 1.0;
+                    entry.current_speed_mbps = 0.0;
+                    entry.is_active = false;
+                    entry.result = Some(result);
+                }
+                Err(TryRecvError::Empty) => {
+                    any_active = self.benchmark_drives.values().any(|d| d.is_active);
+                    break;
+                }
+                Err(TryRecvError::Disconnected) => {
+                    keep = false;
+                    for drive in self.benchmark_drives.values_mut() {
+                        if drive.is_active {
+                            drive.is_active = false;
+                            if !matches!(drive.phase, BenchmarkPhase::Done | BenchmarkPhase::Failed(_)) {
+                                drive.phase = BenchmarkPhase::Done;
+                                drive.progress = 1.0;
+                            }
+                        }
+                    }
+                    break;
+                }
+            }
+        }
+
+        if keep && (any_active || self.benchmark_active) {
+            self.benchmark_rx = Some(rx);
+        } else {
+            self.benchmark_active = false;
+            self.benchmark_cancel_flag = None;
+        }
+    }
+
+    pub fn start_benchmark_all(&mut self) {
+        if self.status == AppStatus::Running {
+            self.push_log("[!] Cannot start benchmark while flashing is running");
+            return;
+        }
+        if self.benchmark_active {
+            self.push_log("[!] Benchmark is already running");
+            return;
+        }
+
+        let drives: Vec<(u32, u64)> = self
+            .devices
+            .iter()
+            .map(|(&n, s)| (n, s.info.size_bytes))
+            .collect();
+
+        if drives.is_empty() {
+            self.push_log("[!] No drives available to benchmark");
+            return;
+        }
+
+        self.benchmark_active = true;
+        for &(n, _) in &drives {
+            let entry = self
+                .benchmark_drives
+                .entry(n)
+                .or_insert_with(|| BenchmarkDriveState::new(n));
+            entry.phase = if self.benchmark_config.wipe_partitions {
+                BenchmarkPhase::WipingPartitions
+            } else {
+                BenchmarkPhase::Writing
+            };
+            entry.progress = 0.0;
+            entry.current_speed_mbps = 0.0;
+            entry.bytes_done = 0;
+            entry.total_bytes = 0;
+            entry.live_write_samples.clear();
+            entry.live_read_samples.clear();
+            entry.result = None;
+            entry.is_active = true;
+        }
+
+        let (rx, cancel_flag) = crate::benchmark::start_benchmark_sessions(
+            drives,
+            self.benchmark_config.clone(),
+        );
+        self.benchmark_rx = Some(rx);
+        self.benchmark_cancel_flag = Some(cancel_flag);
+        self.push_log(format!(
+            "=== Starting benchmark for {} flash drive(s) ===",
+            self.devices.len()
+        ));
+    }
+
+    pub fn start_benchmark_single(&mut self, disk_number: u32) {
+        if self.status == AppStatus::Running {
+            self.push_log("[!] Cannot start benchmark while flashing is running");
+            return;
+        }
+        let Some(slot) = self.devices.get(&disk_number) else {
+            self.push_log(format!("[!] Drive #{} not found", disk_number));
+            return;
+        };
+        let size = slot.info.size_bytes;
+
+        self.benchmark_active = true;
+        let entry = self
+            .benchmark_drives
+            .entry(disk_number)
+            .or_insert_with(|| BenchmarkDriveState::new(disk_number));
+        entry.phase = if self.benchmark_config.wipe_partitions {
+            BenchmarkPhase::WipingPartitions
+        } else {
+            BenchmarkPhase::Writing
+        };
+        entry.progress = 0.0;
+        entry.current_speed_mbps = 0.0;
+        entry.bytes_done = 0;
+        entry.total_bytes = 0;
+        entry.live_write_samples.clear();
+        entry.live_read_samples.clear();
+        entry.result = None;
+        entry.is_active = true;
+
+        let (rx, cancel_flag) = crate::benchmark::start_benchmark_sessions(
+            vec![(disk_number, size)],
+            self.benchmark_config.clone(),
+        );
+        self.benchmark_rx = Some(rx);
+        self.benchmark_cancel_flag = Some(cancel_flag);
+        self.push_log(format!("[#{}] Starting dedicated benchmark…", disk_number));
+    }
+
+    pub fn stop_benchmark(&mut self) {
+        if let Some(flag) = &self.benchmark_cancel_flag {
+            flag.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        self.benchmark_active = false;
+        self.benchmark_rx = None;
+        self.benchmark_cancel_flag = None;
+        for drive in self.benchmark_drives.values_mut() {
+            if drive.is_active {
+                drive.is_active = false;
+                drive.phase = BenchmarkPhase::Cancelled;
+            }
+        }
+        self.return_devices_online();
+        self.push_log("Benchmark cancelled by user");
     }
 
     pub fn handle_write_error_for_device(&mut self, disk_number: u32, message: String) {
