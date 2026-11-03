@@ -123,15 +123,42 @@ fn unmount_path(path: &str) -> io::Result<()> {
 
 pub fn open_drive_write(disk_number: u32) -> io::Result<File> {
     let path = number_to_device_name(disk_number);
-    OpenOptions::new()
-        .write(true)
-        .custom_flags(libc::O_SYNC)
-        .open(&path)
+    let mut last_err = None;
+    // На Linux udev / blkid могут кратковременно захватить устройство после ioctl перечитки разделов.
+    // Делаем несколько попыток с паузой 150мс.
+    for attempt in 0..5 {
+        match OpenOptions::new()
+            .write(true)
+            .custom_flags(libc::O_SYNC)
+            .open(&path)
+        {
+            Ok(f) => return Ok(f),
+            Err(e) => {
+                last_err = Some(e);
+                if attempt < 4 {
+                    std::thread::sleep(std::time::Duration::from_millis(150));
+                }
+            }
+        }
+    }
+    Err(last_err.unwrap_or_else(|| io::Error::new(io::ErrorKind::Other, "Failed to open drive for writing")))
 }
 
 pub fn open_drive_read(disk_number: u32) -> io::Result<File> {
     let path = number_to_device_name(disk_number);
-    OpenOptions::new().read(true).open(&path)
+    let mut last_err = None;
+    for attempt in 0..5 {
+        match OpenOptions::new().read(true).open(&path) {
+            Ok(f) => return Ok(f),
+            Err(e) => {
+                last_err = Some(e);
+                if attempt < 4 {
+                    std::thread::sleep(std::time::Duration::from_millis(150));
+                }
+            }
+        }
+    }
+    Err(last_err.unwrap_or_else(|| io::Error::new(io::ErrorKind::Other, "Failed to open drive for reading")))
 }
 
 pub fn update_disk_properties(file: &File) {

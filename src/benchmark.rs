@@ -339,7 +339,11 @@ pub fn wipe_partition_table(disk_number: u32, disk_size_bytes: u64) -> io::Resul
     drop(file);
 
     #[cfg(not(windows))]
-    crate::engine::sync_all();
+    {
+        crate::engine::sync_all();
+        // Даём udev/ядру успокоиться и завершить перечитку разделов, не блокируя устройство
+        thread::sleep(Duration::from_millis(600));
+    }
 
     Ok(())
 }
@@ -439,6 +443,8 @@ fn run_single_benchmark_worker(
                     "[#{}] [Benchmark] Partition table cleanly wiped ✔",
                     disk_number
                 )));
+                // Дополнительная задержка после затирания для стабилизации шины и диска перед началом стресс-теста
+                thread::sleep(Duration::from_millis(500));
             }
             Err(e) => {
                 let err_msg = format!("Failed to wipe partition table: {}", e);
@@ -479,7 +485,7 @@ fn run_single_benchmark_worker(
         test_bytes as f64 / 1e9
     )));
 
-    const CHUNK_SIZE: usize = 4 * 1024 * 1024; // 4 МБ
+    const CHUNK_SIZE: usize = 1024 * 1024; // 1 МБ для более плавной записи без скачков нагрузки на шину
     let mut pattern_buf = vec![0u8; CHUNK_SIZE];
 
     let mut write_file = match crate::engine::open_drive_write(disk_number) {
@@ -518,14 +524,24 @@ fn run_single_benchmark_worker(
 
         let write_res = write_file.write_all(&pattern_buf[..to_write]);
         if let Err(e) = write_res {
-            if config.mode == BenchmarkMode::Detailed && controller_disconnects < 3 {
+            // Если произошла ошибка записи: даем короткую паузу и пробуем повторить операцию,
+            // чтобы исключить мелкие сбои из-за кратковременной перегрузки буфера или шины
+            let mut recovered = false;
+            let max_retries = if config.mode == BenchmarkMode::Detailed { 5 } else { 2 };
+
+            for retry in 1..=max_retries {
+                if cancel_flag.load(Ordering::Relaxed) {
+                    let _ = crate::engine::set_disk_offline(disk_number, false);
+                    return;
+                }
                 controller_disconnects += 1;
+                let cool_time = if config.mode == BenchmarkMode::Detailed { 3000 } else { 800 };
                 let _ = tx.send(BenchmarkEvent::Log(format!(
-                    "[#{}] [Thermal Diagnostic] Write error at {} MB: {}. Controller likely overheated/reset. Pausing 3s to cool down… (attempt {}/3)",
-                    disk_number, written / 1_048_576, e, controller_disconnects
+                    "[#{}] [Thermal/Bus Diagnostic] Write glitch/drop at {} MB: {}. Pausing {}ms to recover… (retry {}/{})",
+                    disk_number, written / 1_048_576, e, cool_time, retry, max_retries
                 )));
 
-                // Добавляем 0 МБ/с в сэмплы для наглядного отображения термического провала на графике
+                // Добавляем 0 МБ/с в сэмплы для наглядного отображения термического/шинного провала на графике
                 result.write_samples.push(0.0);
                 let _ = tx.send(BenchmarkEvent::SampleAdded {
                     disk_number,
@@ -533,50 +549,43 @@ fn run_single_benchmark_worker(
                     speed_mbps: 0.0,
                 });
 
-                thread::sleep(Duration::from_millis(3000));
+                thread::sleep(Duration::from_millis(cool_time));
 
-                let mut recovered = false;
-                for retry in 1..=5 {
-                    if cancel_flag.load(Ordering::Relaxed) {
-                        let _ = crate::engine::set_disk_offline(disk_number, false);
-                        return;
-                    }
-                    let _ = crate::engine::unmount_all_volumes_on_disk(disk_number);
-                    let _ = crate::engine::set_disk_offline(disk_number, true);
-                    if let Ok(mut new_file) = crate::engine::open_drive_write(disk_number) {
-                        if new_file.seek(SeekFrom::Start(written)).is_ok() {
+                let _ = crate::engine::unmount_all_volumes_on_disk(disk_number);
+                let _ = crate::engine::set_disk_offline(disk_number, true);
+
+                if let Ok(mut new_file) = crate::engine::open_drive_write(disk_number) {
+                    if new_file.seek(SeekFrom::Start(written)).is_ok() {
+                        if new_file.write_all(&pattern_buf[..to_write]).is_ok() {
                             write_file = new_file;
                             recovered = true;
                             let _ = tx.send(BenchmarkEvent::Log(format!(
-                                "[#{}] [Thermal Diagnostic] Controller cooled down & reconnected! Resuming write test from {} MB (retry {}/5)",
-                                disk_number, written / 1_048_576, retry
+                                "[#{}] [Recovery] Successfully resumed write at {} MB ✔",
+                                disk_number, written / 1_048_576
                             )));
                             last_sample_time = Instant::now();
                             bytes_since_sample = 0;
                             break;
                         }
                     }
-                    thread::sleep(Duration::from_millis(1000));
-                }
-
-                if recovered {
-                    continue;
                 }
             }
 
-            let err_msg = if controller_disconnects > 0 {
-                format!("Controller overheated and dropped off bus at {} MB: {}", written / 1_048_576, e)
-            } else {
-                format!("Write error at {} MB: {}", written / 1_048_576, e)
-            };
-            result.error = Some(err_msg.clone());
-            result.controller_disconnects = controller_disconnects;
-            let _ = tx.send(BenchmarkEvent::PhaseChanged {
-                disk_number,
-                phase: BenchmarkPhase::Failed(err_msg),
-            });
-            let _ = crate::engine::set_disk_offline(disk_number, false);
-            return;
+            if !recovered {
+                let err_msg = if controller_disconnects > 0 {
+                    format!("Drive I/O failure/disconnect at {} MB: {}", written / 1_048_576, e)
+                } else {
+                    format!("Write error at {} MB: {}", written / 1_048_576, e)
+                };
+                result.error = Some(err_msg.clone());
+                result.controller_disconnects = controller_disconnects;
+                let _ = tx.send(BenchmarkEvent::PhaseChanged {
+                    disk_number,
+                    phase: BenchmarkPhase::Failed(err_msg),
+                });
+                let _ = crate::engine::set_disk_offline(disk_number, false);
+                return;
+            }
         }
 
         written += to_write as u64;
