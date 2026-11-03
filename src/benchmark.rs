@@ -80,10 +80,39 @@ impl BenchmarkMode {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BenchmarkConcurrency {
+    Sequential, // По очереди: 1 накопитель за раз (безопасно для хабов и питания)
+    Parallel,   // Одновременно все накопители
+}
+
+impl Default for BenchmarkConcurrency {
+    fn default() -> Self {
+        BenchmarkConcurrency::Sequential
+    }
+}
+
+impl BenchmarkConcurrency {
+    pub fn label_en(&self) -> &'static str {
+        match self {
+            BenchmarkConcurrency::Sequential => "Sequential (Safe for USB Hubs)",
+            BenchmarkConcurrency::Parallel => "Parallel (Simultaneous)",
+        }
+    }
+
+    pub fn label_ru(&self) -> &'static str {
+        match self {
+            BenchmarkConcurrency::Sequential => "Последовательно (Безопасно для хабов)",
+            BenchmarkConcurrency::Parallel => "Параллельно (Все сразу)",
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct BenchmarkConfig {
     pub test_size: BenchmarkTestSize,
     pub mode: BenchmarkMode,
+    pub concurrency: BenchmarkConcurrency,
     pub wipe_partitions: bool,
 }
 
@@ -92,6 +121,7 @@ impl Default for BenchmarkConfig {
         Self {
             test_size: BenchmarkTestSize::Size1GB,
             mode: BenchmarkMode::Detailed,
+            concurrency: BenchmarkConcurrency::Sequential,
             wipe_partitions: true,
         }
     }
@@ -362,7 +392,7 @@ fn generate_test_block(block_idx: u64, buf: &mut [u8]) {
     }
 }
 
-/// Запускает бенчмарк для списка дисков.
+/// Запускает бенчмарк для списка дисков (последовательно или параллельно).
 pub fn start_benchmark_sessions(
     drives: Vec<(u32, u64)>,
     config: BenchmarkConfig,
@@ -370,20 +400,46 @@ pub fn start_benchmark_sessions(
     let (tx, rx) = channel();
     let cancel_flag = Arc::new(AtomicBool::new(false));
 
-    for (disk_number, disk_size_bytes) in drives {
-        let tx_clone = tx.clone();
-        let cancel_clone = cancel_flag.clone();
-        let cfg_clone = config.clone();
+    match config.concurrency {
+        BenchmarkConcurrency::Parallel => {
+            for (disk_number, disk_size_bytes) in drives {
+                let tx_clone = tx.clone();
+                let cancel_clone = cancel_flag.clone();
+                let cfg_clone = config.clone();
 
-        thread::spawn(move || {
-            run_single_benchmark_worker(
-                disk_number,
-                disk_size_bytes,
-                cfg_clone,
-                cancel_clone,
-                tx_clone,
-            );
-        });
+                thread::spawn(move || {
+                    run_single_benchmark_worker(
+                        disk_number,
+                        disk_size_bytes,
+                        cfg_clone,
+                        cancel_clone,
+                        tx_clone,
+                    );
+                });
+            }
+        }
+        BenchmarkConcurrency::Sequential => {
+            let tx_clone = tx.clone();
+            let cancel_clone = cancel_flag.clone();
+            let cfg_clone = config.clone();
+
+            thread::spawn(move || {
+                for (disk_number, disk_size_bytes) in drives {
+                    if cancel_clone.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    run_single_benchmark_worker(
+                        disk_number,
+                        disk_size_bytes,
+                        cfg_clone.clone(),
+                        cancel_clone.clone(),
+                        tx_clone.clone(),
+                    );
+                    // Короткая пауза 1 секунда между тестами накопителей для охлаждения и освобождения шины
+                    thread::sleep(Duration::from_millis(1000));
+                }
+            });
+        }
     }
 
     (rx, cancel_flag)
@@ -628,6 +684,9 @@ fn run_single_benchmark_worker(
     #[cfg(not(windows))]
     crate::engine::sync_all();
 
+    // Пауза 1.5 секунды для стабилизации контроллера флешки и шины перед чтением
+    thread::sleep(Duration::from_millis(1500));
+
     let write_duration = write_start.elapsed();
     result.write_metrics = StabilityMetrics::compute(&result.write_samples, written, write_duration, controller_disconnects);
 
@@ -699,11 +758,19 @@ fn run_single_benchmark_worker(
         let to_read = (test_bytes - read_bytes).min(CHUNK_SIZE as u64) as usize;
         let read_res = read_file.read_exact(&mut read_buf[..to_read]);
         if let Err(e) = read_res {
-            if config.mode == BenchmarkMode::Detailed && controller_disconnects < 5 {
+            let mut recovered = false;
+            let max_retries = if config.mode == BenchmarkMode::Detailed { 5 } else { 3 };
+
+            for retry in 1..=max_retries {
+                if cancel_flag.load(Ordering::Relaxed) {
+                    let _ = crate::engine::set_disk_offline(disk_number, false);
+                    return;
+                }
                 controller_disconnects += 1;
+                let cool_time = if config.mode == BenchmarkMode::Detailed { 3000 } else { 1000 };
                 let _ = tx.send(BenchmarkEvent::Log(format!(
-                    "[#{}] [Thermal Diagnostic] Read error at {} MB: {}. Pausing 3s for controller cool-down…",
-                    disk_number, read_bytes / 1_048_576, e
+                    "[#{}] [Thermal/Bus Diagnostic] Read error/reset at {} MB: {}. Pausing {}ms to recover… (retry {}/{})",
+                    disk_number, read_bytes / 1_048_576, e, cool_time, retry, max_retries
                 )));
 
                 result.read_samples.push(0.0);
@@ -713,20 +780,15 @@ fn run_single_benchmark_worker(
                     speed_mbps: 0.0,
                 });
 
-                thread::sleep(Duration::from_millis(3000));
+                thread::sleep(Duration::from_millis(cool_time));
 
-                let mut recovered = false;
-                for _ in 1..=5 {
-                    if cancel_flag.load(Ordering::Relaxed) {
-                        let _ = crate::engine::set_disk_offline(disk_number, false);
-                        return;
-                    }
-                    if let Ok(mut new_file) = crate::device::open_drive_read(disk_number) {
-                        if new_file.seek(SeekFrom::Start(read_bytes)).is_ok() {
+                if let Ok(mut new_file) = crate::device::open_drive_read(disk_number) {
+                    if new_file.seek(SeekFrom::Start(read_bytes)).is_ok() {
+                        if new_file.read_exact(&mut read_buf[..to_read]).is_ok() {
                             read_file = new_file;
                             recovered = true;
                             let _ = tx.send(BenchmarkEvent::Log(format!(
-                                "[#{}] [Thermal Diagnostic] Reconnected! Resuming read test from {} MB",
+                                "[#{}] [Recovery] Successfully resumed read test from {} MB ✔",
                                 disk_number, read_bytes / 1_048_576
                             )));
                             last_read_sample = Instant::now();
@@ -734,23 +796,20 @@ fn run_single_benchmark_worker(
                             break;
                         }
                     }
-                    thread::sleep(Duration::from_millis(1000));
-                }
-
-                if recovered {
-                    continue;
                 }
             }
 
-            let err_msg = format!("Read error at {} MB: {}", read_bytes / 1_048_576, e);
-            result.error = Some(err_msg.clone());
-            result.controller_disconnects = controller_disconnects;
-            let _ = tx.send(BenchmarkEvent::PhaseChanged {
-                disk_number,
-                phase: BenchmarkPhase::Failed(err_msg),
-            });
-            let _ = crate::engine::set_disk_offline(disk_number, false);
-            return;
+            if !recovered {
+                let err_msg = format!("Read error at {} MB: {}", read_bytes / 1_048_576, e);
+                result.error = Some(err_msg.clone());
+                result.controller_disconnects = controller_disconnects;
+                let _ = tx.send(BenchmarkEvent::PhaseChanged {
+                    disk_number,
+                    phase: BenchmarkPhase::Failed(err_msg),
+                });
+                let _ = crate::engine::set_disk_offline(disk_number, false);
+                return;
+            }
         }
 
         // Побитовая верификация с эталонным сгенерированным блоком

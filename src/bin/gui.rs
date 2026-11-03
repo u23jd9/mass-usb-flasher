@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 use eframe::egui::{self, Align, Align2, Color32, Layout, RichText, Rounding, Stroke, Vec2};
 
 use mass_usb_flasher::app::{AppState, AppStatus, SlotStatus};
-use mass_usb_flasher::benchmark::{BenchmarkMode, BenchmarkPhase, BenchmarkTestSize};
+use mass_usb_flasher::benchmark::{BenchmarkConcurrency, BenchmarkMode, BenchmarkPhase, BenchmarkTestSize};
 use mass_usb_flasher::catalog::Catalog;
 use mass_usb_flasher::common::{
     compute_window_title, ensure_automount_enabled, ensure_elevated, format_elapsed,
@@ -397,6 +397,7 @@ impl MufGuiApp {
     fn render_top_bar(&mut self, ui: &mut egui::Ui) {
         let t = self.state.t();
         ui.horizontal(|ui| {
+            // Левая часть: Название приложения, версия и вкладки
             ui.heading(
                 RichText::new("⚡ Mass USB Flasher")
                     .strong()
@@ -445,105 +446,7 @@ impl MufGuiApp {
 
             ui.add_space(8.0);
 
-            if self.current_tab == AppTab::Flashing {
-                // Кнопка переключения сайдбара библиотеки образов
-                if ui
-                    .selectable_label(
-                        self.show_images_sidebar,
-                        RichText::new(format!("{} ({})", t.gui_sidebar_toggle, self.state.catalog.images.len()))
-                            .strong(),
-                    )
-                    .clicked()
-                {
-                    self.show_images_sidebar = !self.show_images_sidebar;
-                }
-
-                ui.add_space(10.0);
-
-                // Статус-бейдж
-                let (status_text, bg_color, fg_color) = match self.state.status {
-                    AppStatus::Idle => (t.status_idle, Color32::from_rgb(60, 60, 70), Color32::WHITE),
-                    AppStatus::WaitingForDevices => (
-                        t.status_waiting,
-                        Color32::from_rgb(180, 110, 0),
-                        Color32::WHITE,
-                    ),
-                    AppStatus::Ready => (
-                        t.status_ready,
-                        Color32::from_rgb(34, 139, 34),
-                        Color32::WHITE,
-                    ),
-                    AppStatus::Running => (
-                        t.status_running,
-                        Color32::from_rgb(25, 118, 210),
-                        Color32::WHITE,
-                    ),
-                    AppStatus::Finished => (
-                        t.status_finished,
-                        Color32::from_rgb(142, 36, 170),
-                        Color32::WHITE,
-                    ),
-                };
-
-                egui::Frame::none()
-                    .fill(bg_color)
-                    .rounding(Rounding::same(4.0))
-                    .inner_margin(egui::Margin::symmetric(10.0, 4.0))
-                    .show(ui, |ui| {
-                        ui.label(RichText::new(status_text).strong().color(fg_color));
-                    });
-
-                // Управление целевым количеством + Автотаргет
-                ui.add_space(16.0);
-                ui.label(RichText::new(t.lbl_target).strong());
-                if ui.button("➖").clicked() {
-                    self.state.decrease_target();
-                }
-                ui.label(
-                    RichText::new(format!("{}", self.state.target_count))
-                        .strong()
-                        .size(16.0)
-                        .color(Color32::from_rgb(255, 215, 0)),
-                );
-                if ui.button("➕").clicked() {
-                    self.state.increase_target();
-                }
-
-                let auto_color = if self.state.autotarget {
-                    Color32::from_rgb(76, 175, 80)
-                } else {
-                    Color32::from_rgb(130, 135, 145)
-                };
-                if ui
-                    .small_button(RichText::new(format!("[{}]", t.gui_autotarget_btn)).color(auto_color).strong())
-                    .on_hover_text("Auto-target: matches total connected USB drives automatically")
-                    .clicked()
-                {
-                    self.state.enable_autotarget();
-                }
-            } else {
-                // Статус-бейдж для вкладки бенчмарка
-                let (status_text, bg_color, fg_color) = if self.state.benchmark_active {
-                    (t.bench_summary_running, Color32::from_rgb(180, 110, 0), Color32::WHITE)
-                } else if self.state.devices.is_empty() {
-                    (t.bench_no_devices, Color32::from_rgb(60, 60, 70), Color32::WHITE)
-                } else {
-                    (t.bench_status_idle, Color32::from_rgb(34, 139, 34), Color32::WHITE)
-                };
-
-                egui::Frame::none()
-                    .fill(bg_color)
-                    .rounding(Rounding::same(4.0))
-                    .inner_margin(egui::Margin::symmetric(10.0, 4.0))
-                    .show(ui, |ui| {
-                        ui.label(RichText::new(status_text).strong().color(fg_color));
-                    });
-            }
-            {
-                self.state.enable_autotarget();
-            }
-
-            // Переключатели масштаба (Autoscaling), темы и языка
+            // Правая часть: элементы управления языком, темой, масштабом
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 if ui
                     .button(
@@ -584,6 +487,102 @@ impl MufGuiApp {
                         ui.selectable_value(&mut self.ui_scale_mode, UiScaleMode::Scale175, "175%");
                         ui.selectable_value(&mut self.ui_scale_mode, UiScaleMode::Scale200, "200%");
                     });
+
+                ui.separator();
+
+                // Центр/оставшееся пространство справа налево: целевое кол-во и статус-бейдж
+                if self.current_tab == AppTab::Flashing {
+                    let auto_color = if self.state.autotarget {
+                        Color32::from_rgb(76, 175, 80)
+                    } else {
+                        Color32::from_rgb(130, 135, 145)
+                    };
+                    if ui
+                        .small_button(RichText::new(format!("[{}]", t.gui_autotarget_btn)).color(auto_color).strong())
+                        .on_hover_text("Auto-target: matches total connected USB drives automatically")
+                        .clicked()
+                    {
+                        self.state.enable_autotarget();
+                    }
+
+                    if ui.button("➕").clicked() {
+                        self.state.increase_target();
+                    }
+                    ui.label(
+                        RichText::new(format!("{}", self.state.target_count))
+                            .strong()
+                            .size(15.0)
+                            .color(Color32::from_rgb(255, 215, 0)),
+                    );
+                    if ui.button("➖").clicked() {
+                        self.state.decrease_target();
+                    }
+                    ui.label(RichText::new(t.lbl_target).strong());
+
+                    ui.add_space(6.0);
+
+                    // Статус-бейдж
+                    let (status_text, bg_color, fg_color) = match self.state.status {
+                        AppStatus::Idle => (t.status_idle, Color32::from_rgb(60, 60, 70), Color32::WHITE),
+                        AppStatus::WaitingForDevices => (
+                            t.status_waiting,
+                            Color32::from_rgb(180, 110, 0),
+                            Color32::WHITE,
+                        ),
+                        AppStatus::Ready => (
+                            t.status_ready,
+                            Color32::from_rgb(34, 139, 34),
+                            Color32::WHITE,
+                        ),
+                        AppStatus::Running => (
+                            t.status_running,
+                            Color32::from_rgb(25, 118, 210),
+                            Color32::WHITE,
+                        ),
+                        AppStatus::Finished => (
+                            t.status_finished,
+                            Color32::from_rgb(142, 36, 170),
+                            Color32::WHITE,
+                        ),
+                    };
+
+                    egui::Frame::none()
+                        .fill(bg_color)
+                        .rounding(Rounding::same(4.0))
+                        .inner_margin(egui::Margin::symmetric(8.0, 3.0))
+                        .show(ui, |ui| {
+                            ui.label(RichText::new(status_text).strong().size(12.0).color(fg_color));
+                        });
+
+                    // Кнопка переключения сайдбара библиотеки образов
+                    if ui
+                        .selectable_label(
+                            self.show_images_sidebar,
+                            RichText::new(format!("{} ({})", t.gui_sidebar_toggle, self.state.catalog.images.len()))
+                                .strong(),
+                        )
+                        .clicked()
+                    {
+                        self.show_images_sidebar = !self.show_images_sidebar;
+                    }
+                } else {
+                    // Статус-бейдж для вкладки бенчмарка
+                    let (status_text, bg_color, fg_color) = if self.state.benchmark_active {
+                        (t.bench_summary_running, Color32::from_rgb(180, 110, 0), Color32::WHITE)
+                    } else if self.state.devices.is_empty() {
+                        (t.bench_no_devices, Color32::from_rgb(60, 60, 70), Color32::WHITE)
+                    } else {
+                        (t.bench_status_idle, Color32::from_rgb(34, 139, 34), Color32::WHITE)
+                    };
+
+                    egui::Frame::none()
+                        .fill(bg_color)
+                        .rounding(Rounding::same(4.0))
+                        .inner_margin(egui::Margin::symmetric(8.0, 3.0))
+                        .show(ui, |ui| {
+                            ui.label(RichText::new(status_text).strong().size(12.0).color(fg_color));
+                        });
+                }
             });
         });
     }
@@ -611,9 +610,10 @@ impl MufGuiApp {
                                 .strong()
                                 .color(Color32::from_rgb(218, 112, 214)),
                         );
-                        ui.label(
-                            RichText::new(path.file_name().unwrap_or_default().to_string_lossy())
-                                .strong(),
+                        let file_name = path.file_name().unwrap_or_default().to_string_lossy().to_string();
+                        ui.add(
+                            egui::Label::new(RichText::new(file_name).strong())
+                                .truncate()
                         )
                         .on_hover_text(path.display().to_string());
 
@@ -655,10 +655,13 @@ impl MufGuiApp {
                 ui.horizontal(|ui| {
                     ui.label(RichText::new(t.lbl_sha256).weak());
                     if let Some(hash) = &self.state.image_sha256 {
-                        ui.label(
-                            RichText::new(hash)
-                                .monospace()
-                                .color(Color32::from_rgb(76, 175, 80)),
+                        ui.add(
+                            egui::Label::new(
+                                RichText::new(hash)
+                                    .monospace()
+                                    .color(Color32::from_rgb(76, 175, 80)),
+                            )
+                            .truncate()
                         );
                     } else if let Some((done, total)) = self.state.image_hash_progress {
                         let pct = if total > 0 {
@@ -717,10 +720,35 @@ impl MufGuiApp {
                             RichText::new(t.bench_wipe_partitions).strong().size(12.0),
                         ).on_hover_text("Crucial: writes zeroes to sector 0 (MBR/GPT) and backup GPT at the end of the disk so OS releases volume locks");
 
-                        ui.add_space(14.0);
+                        ui.add_space(10.0);
+
+                        let lang = self.state.lang;
+
+                        // Выбор режима очередности (Последовательно / Параллельно)
+                        let conc_label = match lang {
+                            mass_usb_flasher::i18n::Lang::Ru => self.state.benchmark_config.concurrency.label_ru(),
+                            mass_usb_flasher::i18n::Lang::En => self.state.benchmark_config.concurrency.label_en(),
+                        };
+
+                        egui::ComboBox::from_id_salt("bench_concurrency_combo")
+                            .selected_text(RichText::new(conc_label).strong().color(Color32::from_rgb(76, 175, 80)))
+                            .show_ui(ui, |ui| {
+                                for &c in &[BenchmarkConcurrency::Sequential, BenchmarkConcurrency::Parallel] {
+                                    let l = match lang {
+                                        mass_usb_flasher::i18n::Lang::Ru => c.label_ru(),
+                                        mass_usb_flasher::i18n::Lang::En => c.label_en(),
+                                    };
+                                    ui.selectable_value(&mut self.state.benchmark_config.concurrency, c, l);
+                                }
+                            })
+                            .response
+                            .on_hover_text("Sequential: tests one drive at a time. Strongly recommended when using USB hubs to prevent bus power drop and xHCI resets.");
+
+                        ui.label(RichText::new(t.bench_lbl_concurrency).strong());
+
+                        ui.add_space(10.0);
 
                         // Выбор режима (Обычный / Детальный с термодиагностикой перегрева)
-                        let lang = self.state.lang;
                         let mode_label = match lang {
                             mass_usb_flasher::i18n::Lang::Ru => self.state.benchmark_config.mode.label_ru(),
                             mass_usb_flasher::i18n::Lang::En => self.state.benchmark_config.mode.label_en(),
@@ -742,7 +770,7 @@ impl MufGuiApp {
 
                         ui.label(RichText::new(t.bench_lbl_mode).strong());
 
-                        ui.add_space(14.0);
+                        ui.add_space(10.0);
 
                         // Выбор объёма теста
                         let current_size_label = match lang {
