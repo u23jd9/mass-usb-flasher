@@ -1,114 +1,118 @@
 # Mass USB Flasher (MUF) ⚡
 
-Кроссплатформенная легковесная утилита на **Rust** для высокоскоростной одновременной прошивки и аппаратного бенчмарка USB-накопителей (`.img`, `.iso`, `.raw`).
+A high-performance, lightweight cross-platform utility written in **Rust** for concurrent raw disk flashing and hardware stress-testing / benchmarking of USB flash drives (`.img`, `.iso`, `.raw`).
 
-Разработана для коммерческого и промышленного применения: тиражирование партий флешек (5+ штук одновременно) с гарантией целостности, высокой скоростью, встроенной диагностикой накопителей и удобным интерфейсом.
-
----
-
-## 🚀 Особенности и возможности
-
-* **Две версии интерфейса из одной кодовой базы:**
-  * **GUI (`muf-gui`):** Современный графический интерфейс на базе `eframe`/`egui`. Автономен, не требует сторонних библиотек, поддерживает масштабирование UI, тёмную/светлую тему и адаптивную вёрстку.
-  * **TUI (`muf-tui`):** Быстрый консольный терминальный интерфейс на базе `ratatui` (всего **~2.0 МБ**).
-* **Параллельная запись без перегрузки диска:**
-  Используется движок `bus_writer` от System76 — lock-free broadcast. Образ читается из файла один раз буфером 8 МБ и параллельно транслируется во все открытые накопители одновременно.
-* **⚡ Встроенный аппаратно-стрессовый бенчмарк флешек:**
-  Отдельная вкладка для полной проверки качества и стабильности накопителей перед тиражированием:
-  * **Затирание таблицы разделов (MBR/GPT):** Перед стартом теста автоматически затираются первые и последние 4 МБ флешки (MBR, первичный и резервный GPT-заголовки) с принудительным снятием блокировок томов ОС.
-  * **Тестирование последовательной записи и чтения:** Генерация псевдослучайных несжимаемых блоков (SplitMix64) с побитовой верификацией целостности данных при чтении.
-  * **Метрики стабильности и графики (Sparkline):** Расчёт средней, минимальной и максимальной скорости, стандартного отклонения (StdDev) и коэффициента стабильности (`Stability %`). В реальном времени строится график скорости.
-  * **Очередь тестирования (Sequential vs Parallel):** Режим **Последовательно** (по умолчанию) тестирует накопители по очереди, защищая USB-хабы от перегрузки линий питания и падений портов, а режим **Параллельно** запускает стресс-тест всех дисков одновременно.
-  * **Детальная термодиагностика контроллера:** Автоматическое обнаружение сбоев/перегрева контроллеров памяти, интеллектуальные паузы для охлаждения и восстановление сессии ввода-вывода.
-* **Надёжная работа на Windows:**
-  * Решена проблема `ACCESS_DENIED` при записи на активные накопители: утилита находит все разделы (включая скрытые и EFI через `FindFirstVolumeW`), демонтирует их и переводит диск в режим **offline** (`IOCTL_DISK_SET_DISK_ATTRIBUTES`).
-  * Высокая скорость ввода-вывода благодаря `FILE_FLAG_NO_BUFFERING` без замедляющего `WRITE_THROUGH`.
-  * Интеграция с прогрессом в Панели задач Windows (Taskbar) через COM `ITaskbarList3`.
-  * Автоматический запрос прав Администратора через встроенный манифест приложения.
-* **Полная поддержка Linux:**
-  * Обнаружение устройств через `/sys/block` и `sysfs`.
-  * Прямая запись через `O_SYNC` в `/dev/sdX` с размонтированием (`umount2`) и защитой от конфликтов с `systemd-udevd`.
-* **Сброс в состояние Ready / Idle:**
-  После успешной записи партии накопителей доступна кнопка в GUI **`[ 🔄 Ready for Next Batch ]`** и горячая клавиша **`[R]` / `[Enter]`** в TUI для мгновенного сброса состояния и готовности к следующей партии без перезапуска утилиты.
-* **Каталог образов и асинхронный SHA-256:**
-  * Встроенный каталог образов (`%USERPROFILE%\.muf\catalog.json` / `~/.config/muf/catalog.json`) с рабочими именами.
-  * Пакетный импорт папок с образами по манифесту `.muf-images.json`.
-  * Асинхронный подсчёт контрольной суммы SHA-256 с отображением прогресса и скорости.
-* **Двуязычный интерфейс:**
-  Мгновенное переключение языка между **Русским** и **Английским** в один клик или по клавише `L`.
+**English** • [Русская версия](README.ru.md)
 
 ---
 
-## ⚡ Как работает бенчмарк флешек
-
-Вкладка **«Бенчмарк флешек»** (`Benchmark`) решает задачу выявления медленных, бракованных или перегревающихся флешек:
-
-1. **Шаг 1: Затирание MBR и резервного GPT**
-   * Обнуляет служебные секторы диска (LBA 0 и Backup GPT в конце накопителя), сбрасывает кэш ядра и предотвращает автоподмонтирование разделов системой.
-2. **Шаг 2: Последовательная запись**
-   * Записывает заданный объём (от 256 МБ до полного объёма флешки) псевдослучайными блоками. Измеряет пиковую и среднюю скорость, а также просадки при заполнении SLC-кэша.
-3. **Шаг 3: Сброс буферов и пауза стабилизации**
-   * Выполняет принудительный сброс данных на кристаллы NAND и даёт паузу 1.5 секунды для стабилизации шины питания.
-4. **Шаг 4: Последовательное чтение и верификация**
-   * Считывает записанные данные на предельной скорости интерфейса и побайтово проверяет их на соответствие эталонному генератору. Если данные искажены или флешка потеряла блоки — выставляется предупреждение о нарушении целостности (`Integrity errors`).
-5. **Шаг 5: Итоговый вердикт стабильности**
-   * Вычисляется коэффициент стабильности (`Stability %`). Выносится вердикт: *Отличная*, *Хорошая*, *Термотроттлинг* или *Перегрев/Сброс контроллера*.
+Designed for commercial and industrial deployment workflows: replicating batches of USB drives (5+ devices simultaneously) with guaranteed integrity, blazing-fast speeds, built-in drive health/thermal diagnostics, and an intuitive UI.
 
 ---
 
-## 📦 Сборка и бинарные релизы
+## 🚀 Features & Highlights
+
+* **Dual Interface from a Single Codebase:**
+  * **GUI (`muf-gui`):** Modern graphical interface built with `eframe`/`egui`. Completely standalone, zero external dependencies, native HiDPI adaptive scaling, Light/Dark theme toggle, and responsive layout.
+  * **TUI (`muf-tui`):** Ultra-fast terminal dashboard built with `ratatui` (~2.0 MB).
+* **Parallel Broadcast Writing without Disk Bottlenecks:**
+  Powered by System76's lock-free `bus_writer`. The source disk image is read into an 8 MB buffer once and broadcast concurrently to all opened flash drives.
+* **⚡ Built-in Hardware Stress Benchmark & Stability Tester:**
+  A dedicated tab designed to weed out counterfeit, slow, or thermally unstable flash drives before mass production:
+  * **Partition Table Wipe (MBR/GPT):** Automatically wipes the first and last 4 MB of each drive (MBR, primary and backup secondary GPT headers) and forcefully unmounts OS volume locks before testing.
+  * **Sequential Write & Read Tests:** Generates deterministic pseudo-random non-compressible blocks (SplitMix64) to prevent controller hardware compression, paired with bitwise verification on read.
+  * **Real-time Stability Metrics & Sparklines:** Computes Average, Minimum, and Maximum speeds, standard deviation (StdDev), and a percentage stability score (`Stability %`) with real-time polyline graphing.
+  * **Queue Scheduling (Sequential vs Parallel):** **Sequential** mode (default) tests drives one by one to safeguard USB hubs against 5V power drops and host controller resets; **Parallel** runs stress-tests across all drives at once.
+  * **Detailed Controller Thermal Diagnostics:** Detects flash controller resets and dropouts caused by thermal overload, inserts cooling pauses, and resumes tests automatically without false failures.
+* **Rock-solid Windows Support:**
+  * Solves `ACCESS_DENIED` errors on live drives by unmounting hidden/EFI volumes (`FindFirstVolumeW`) and taking disks **offline** via `IOCTL_DISK_SET_DISK_ATTRIBUTES`.
+  * Maximum I/O throughput with `FILE_FLAG_NO_BUFFERING` bypassing `WRITE_THROUGH`.
+  * Native Windows Taskbar progress integration via COM `ITaskbarList3`.
+  * Embedded UAC manifest requesting Administrator privileges automatically.
+* **First-class Linux Support:**
+  * Device discovery and hotplug via `/sys/block` and `sysfs`.
+  * Direct synchronous I/O via `O_SYNC` to `/dev/sdX` with clean partition unmounting (`umount2`) and `systemd-udevd` race condition prevention.
+* **One-Click Batch Reset (Ready / Idle):**
+  Instantly prepare for the next batch with GUI button **`[ 🔄 Ready for Next Batch ]`** or TUI key **`[R]` / `[Enter]`** without restarting the application.
+* **Image Catalog & Background SHA-256:**
+  * Built-in image library (`%USERPROFILE%\.muf\catalog.json` / `~/.config/muf/catalog.json`) with custom labels.
+  * Batch folder imports via `.muf-images.json` metadata manifests.
+  * Non-blocking background SHA-256 calculation with live progress and throughput metrics.
+* **Bilingual UI:**
+  Instant 1-click toggle between **English** and **Russian** (`L` key).
+
+---
+
+## ⚡ How the USB Benchmark Works
+
+The **Benchmark** tab isolates flaky, fake, or overheating USB flash drives through a 5-step automated pipeline:
+
+1. **Step 1: Partition Table Erasure (MBR & GPT)**
+   * Zeroes out sector 0 and the secondary backup GPT at the end of the physical media, flushes kernel caches, and releases volume handles.
+2. **Step 2: Sequential Write Test**
+   * Writes configured sample sizes (from 256 MB up to Full Disk) using pseudo-random patterned data. Measures sustained write speed and detects SLC-cache exhaustion drops.
+3. **Step 3: Cache Flush & Cool-down Settle Pause**
+   * Enforces raw NAND buffer synchronization and provides a 1.5-second settle window to stabilize power rails.
+4. **Step 4: Sequential Read & Bitwise Verification**
+   * Reads data back at full interface speed, verifying each 64-bit chunk against the SplitMix64 generator to detect bit flips, bad sectors, or counterfeit capacity.
+5. **Step 5: Stability Verdict & Telemetry**
+   * Computes coefficient of speed variance (`Stability %`) and assigns a human-readable verdict (*Excellent*, *Good*, *Thermal Throttle*, or *Controller Dropout*).
+
+---
+
+## 📦 Releases & Binaries
 
 > [!NOTE]
-> **Тестирование платформ и стабильность:**
-> * Свежие версии и функционал всегда тестируются и валидируются в первую очередь под **Linux (Ubuntu / Fedora)**.
-> * Версия **[v0.1.1](https://github.com/u23jd9/mass-usb-flasher/releases/tag/v0.1.1)** тщательно протестирована и стабильна как на Linux, так и на **Windows**.
-> * В новых и pre-release версиях (v0.1.2-beta+) функционал активно дорабатывается — на свежих билдах возможны непредвиденные баги и ошибки.
+> **Platform Testing & Stability Policy:**
+> * Bleeding-edge features and new versions are always developed and verified primarily on **Linux (Ubuntu / Fedora)**.
+> * Version **[v0.1.1](https://github.com/u23jd9/mass-usb-flasher/releases/tag/v0.1.1)** is thoroughly tested and verified on both Linux and **Windows**.
+> * New releases and pre-release builds (v0.1.2-beta+) undergo active evolution; unexpected bugs or edge-case quirks may occur.
 
-Собранные бинарники доступны на странице [GitHub Releases](https://github.com/u23jd9/mass-usb-flasher/releases):
+Pre-compiled standalone binaries are available on [GitHub Releases](https://github.com/u23jd9/mass-usb-flasher/releases):
 
-| Исполняемый файл | Платформа | Интерфейс | Описание |
+| Binary | Platform | Interface | Description |
 |---|---|---|---|
-| `muf-gui` | Linux (x86_64) | GUI | Графическое приложение (Wayland / X11) с вкладками записи и бенчмарка |
-| `muf-tui` | Linux (x86_64) | TUI | Терминальное консольное приложение |
-| `muf-gui.exe` | Windows (x64) | GUI | Оконное приложение с иконкой и UAC-манифестом |
-| `muf-tui.exe` | Windows (x64) | TUI | Консольное терминальное приложение |
+| `muf-gui` | Linux (x86_64) | GUI | Native graphical application (Wayland / X11) with Flashing & Benchmark tabs |
+| `muf-tui` | Linux (x86_64) | TUI | Terminal console dashboard |
+| `muf-gui.exe` | Windows (x64) | GUI | Windowed standalone binary with embedded icon & UAC manifest |
+| `muf-tui.exe` | Windows (x64) | TUI | Console terminal application |
 
 ---
 
-## 🛠 Сборка из исходников
+## 🛠 Building from Source
 
-Для сборки требуется компилятор **Rust** (версии 1.80+).
+Requires the **Rust** toolchain (1.80+).
 
 ```bash
-# Клонирование репозитория
+# Clone the repository
 git clone https://github.com/u23jd9/mass-usb-flasher.git
 cd mass-usb-flasher
 
-# Сборка обеих версий (TUI и GUI) в релизном профиле
+# Build both TUI and GUI in release mode
 cargo build --release
 ```
 
-Готовые файлы появятся в директории `target/release/`:
+Binaries will be output to `target/release/`:
 * `muf-gui`
 * `muf-tui`
 
 ---
 
-## ⌨ Горячие клавиши (TUI)
+## ⌨ Hotkeys (TUI)
 
-| Клавиша | Действие |
+| Key | Action |
 |---|---|
-| `I` | Открыть каталог образов |
-| `S` | Запустить параллельную запись (когда статус Ready) |
-| `R` / `Enter` | Сбросить статус в Готово / Ожидание для новой партии |
-| `+` / `-` | Изменить количество целевых флешек (Target) |
-| `L` | Переключить язык (Русский / English) |
-| `H` | Справка |
-| `Q` / `Ctrl+C` | Выход |
+| `I` | Open Image Catalog |
+| `S` | Start concurrent flashing (when Ready) |
+| `R` / `Enter` | Reset status to Ready / Waiting for next batch |
+| `+` / `-` | Adjust Target drive count |
+| `L` | Toggle language (English / Russian) |
+| `H` | Help overlay |
+| `Q` / `Ctrl+C` | Quit |
 
 ---
 
-## 📄 Лицензия и авторство
+## 📄 License & Author
 
-Разработано: **TG: [@delyoself](https://t.me/delyoself)**  
-Лицензия: MIT / Apache-2.0
+Crafted by: **Telegram: [@delyoself](https://t.me/delyoself)**  
+License: MIT / Apache-2.0
